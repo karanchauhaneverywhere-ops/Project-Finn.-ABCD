@@ -146,7 +146,7 @@ function renderResult(stack) {
     var li = document.createElement("li");
     li.innerHTML =
       "<strong>" + (i + 1) + ". " + item.text + "</strong>" +
-      '<a href="' + item.href + '">' + item.label + " →</a>";
+      '<a href="' + item.href + '">' + item.label + ' <svg class="icon"><use href="#i-chevron"/></svg></a>';
     resultList.appendChild(li);
   });
   questionsWrap.classList.add("hidden");
@@ -247,7 +247,7 @@ function updateStreak(hasCheckedToday) {
     bumpStreakBadge();
   }
   if (streakBadge) {
-    streakBadge.textContent = "🔥 " + streak.count + "-day streak";
+    streakBadge.innerHTML = '<svg class="icon"><use href="#i-flame"/></svg> ' + streak.count + "-day streak";
   }
 }
 
@@ -268,13 +268,13 @@ function renderRoutine() {
 
     var label = document.createElement("label");
     label.setAttribute("for", "habit-" + i);
-    label.style.display = "flex";
-    label.style.alignItems = "center";
-    label.style.gap = "0.6rem";
-    label.style.width = "100%";
-    label.style.cursor = "pointer";
+
+    var checkMark = document.createElement("span");
+    checkMark.className = "check-box";
+    checkMark.innerHTML = '<svg class="icon"><use href="#i-check"/></svg>';
 
     var span = document.createElement("span");
+    span.className = "habit-text";
     span.textContent = habit;
 
     checkbox.addEventListener("change", function () {
@@ -288,6 +288,7 @@ function renderRoutine() {
     });
 
     label.appendChild(checkbox);
+    label.appendChild(checkMark);
     label.appendChild(span);
     li.appendChild(label);
     routineList.appendChild(li);
