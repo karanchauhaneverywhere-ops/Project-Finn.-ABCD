@@ -25,6 +25,12 @@
       <li><a href="#routine">My Routine</a></li>
       <li><a href="#faq">FAQ</a></li>
     </ul>
+    <div class="header-actions">
+      <button class="theme-toggle" id="themeToggle" aria-label="Toggle dark mode">🌙</button>
+      <span id="authWidget" class="auth-widget">
+        <a href="login.html" class="btn btn-ghost small" id="authLink">Sign in</a>
+      </span>
+    </div>
   </nav>
 </header>
 
@@ -32,6 +38,8 @@
 
   <!-- HOOK: interactive assessment, first thing visitors see -->
   <section class="hero">
+    <div class="blob blob-a"></div>
+    <div class="blob blob-b"></div>
     <div class="hero-inner">
       <p class="eyebrow">100% free · 60 seconds · no products required</p>
       <h1>What's actually holding your look back?</h1>
@@ -293,7 +301,10 @@
       <h2><span class="tag">07</span> Build My Daily Routine</h2>
       <p class="category-intro">
         Check off habits as you build them into your day. Your progress — and your streak — is saved
-        automatically in this browser. Nothing is uploaded anywhere, so it stays completely free and private.
+        automatically in this browser. Nothing is uploaded anywhere unless you choose to sign in.
+      </p>
+      <p class="sync-note" id="syncNote">
+        <a href="login.html">Sign in</a> to sync this across your devices — completely optional.
       </p>
       <div class="routine-box">
         <div class="streak-badge" id="streakBadge">🔥 0-day streak</div>
@@ -338,6 +349,6 @@
   <p>If appearance-related thoughts are affecting your wellbeing, please reach out to a doctor or mental health professional.</p>
 </footer>
 
-<script src="script.js"></script>
+<script type="module" src="script.js"></script>
 </body>
 </html>
