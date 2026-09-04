@@ -285,6 +285,7 @@ function renderRoutine() {
       updateProgress();
       updateStreak(Object.keys(s).some(function (k) { return s[k]; }));
       scheduleRoutineSync();
+      renderHeatmap();
     });
 
     label.appendChild(checkbox);
@@ -297,6 +298,48 @@ function renderRoutine() {
   updateProgress();
   var anyChecked = Object.keys(state).some(function (k) { return state[k]; });
   updateStreak(anyChecked);
+  renderHeatmap();
+}
+
+/* Sequential single-hue heat ramp (heat-0..heat-4, light->dark) rendered as
+   a 10-week x 7-day grid from the existing per-day routine data. */
+function renderHeatmap() {
+  var grid = document.getElementById("heatmapGrid");
+  if (!grid) return;
+
+  var all = readJSON(ROUTINE_STATE_KEY, {});
+  var totalDays = 70;
+  var today = new Date();
+  today.setHours(0, 0, 0, 0);
+  var start = new Date(today);
+  start.setDate(start.getDate() - (totalDays - 1));
+
+  grid.innerHTML = "";
+
+  var startWeekday = start.getDay();
+  for (var p = 0; p < startWeekday; p++) {
+    var pad = document.createElement("span");
+    pad.className = "heatmap-cell";
+    pad.style.visibility = "hidden";
+    grid.appendChild(pad);
+  }
+
+  for (var i = 0; i < totalDays; i++) {
+    var d = new Date(start);
+    d.setDate(d.getDate() + i);
+    var key = d.getFullYear() + "-" + (d.getMonth() + 1) + "-" + d.getDate();
+    var state = all[key] || {};
+    var done = Object.keys(state).reduce(function (sum, k) { return sum + (state[k] ? 1 : 0); }, 0);
+    var level = done === 0 ? 0 : done <= 2 ? 1 : done <= 4 ? 2 : done <= 6 ? 3 : 4;
+
+    var cell = document.createElement("span");
+    cell.className = "heatmap-cell";
+    cell.setAttribute("data-level", String(level));
+    var label = d.toLocaleDateString(undefined, { month: "short", day: "numeric" }) + " — " + done + "/" + habits.length + " done";
+    cell.title = label;
+    cell.setAttribute("aria-label", label);
+    grid.appendChild(cell);
+  }
 }
 
 function updateProgress() {
