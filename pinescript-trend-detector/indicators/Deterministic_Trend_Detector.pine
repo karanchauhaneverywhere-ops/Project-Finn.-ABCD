@@ -1,7 +1,7 @@
 //@version=6
 
 // =============================================================================
-// Deterministic Trend Detector
+// Deterministic Trend Detector (v2 — signal-accuracy pass)
 // -----------------------------------------------------------------------------
 // Classifies the current market as Strong Uptrend / Uptrend / Sideways-Range /
 // Downtrend / Strong Downtrend using only closed-form deterministic math:
@@ -17,6 +17,25 @@
 // Nothing here is a probability, a statistical inference (p-value, confidence
 // interval, Bayesian posterior) or a machine-learning likelihood — see
 // ../METHODOLOGY.md for the full rationale and formulas.
+//
+// v2 fixes four things that made the printed signal less accurate than the
+// underlying math, and align this script with the v2 strategy's logic:
+//
+//   a. Bar-close confirmation. The state machine advances only on a closed
+//      bar (toggleable), so a label/alert can no longer appear mid-bar and
+//      then vanish before the bar closes — the "signal that wasn't there"
+//      problem when trading live.
+//   b. Hysteresis. Entering a trend state needs the score to reach
+//      `weakThresh`; leaving it needs the score to fall back to the separate,
+//      looser `exitThresh`. v1 used one shared boundary, so a single point of
+//      score noise flipped the label (and fired an alert) on adjacent bars.
+//   c. Choppiness is now an entry filter, not a label override. A chop spike
+//      blocks a *new* trend call but no longer rewrites an established trend
+//      to "Sideways" — v1 could hide a score-5 trend behind a transient chop
+//      reading. Chop status is still reported separately, so nothing is lost.
+//   d. Bug: the Choppiness divide-by-zero guard returned 0.0, and 0 is the
+//      "perfectly trending" end of the CHOP scale — a degenerate flat window
+//      therefore reported maximum trendiness. It now returns na.
 //
 // This script is for research/education. It is not financial advice.
 // =============================================================================
@@ -37,9 +56,9 @@ adxSmooth    = input.int(14, "ADX smoothing", minval = 1, group = grpDmi)
 adxThreshold = input.float(20.0, "ADX trend threshold", minval = 0, group = grpDmi)
 
 grpChop = "Choppiness Index"
-chopLen         = input.int(14, "Choppiness length", minval = 2, group = grpChop)
-chopSidewaysMin = input.float(61.8, "Choppiness >= this => sideways", group = grpChop)
-chopOverride    = input.bool(true, "Let Choppiness force the 'Sideways' label", group = grpChop)
+chopLen           = input.int(14, "Choppiness length", minval = 2, group = grpChop)
+chopSidewaysMin   = input.float(61.8, "Choppiness >= this => choppy", group = grpChop)
+chopFilterEntries = input.bool(true, "Choppiness blocks NEW trend calls (does not cancel an established one)", group = grpChop)
 
 grpStruct = "Swing Structure (Dow Theory)"
 pivotLeft  = input.int(5, "Pivot left bars", minval = 1, group = grpStruct)
@@ -53,8 +72,10 @@ slowLen       = input.int(200, "Slow MA length", minval = 1, group = grpMa)
 slopeLookback = input.int(10, "Slow MA slope lookback", minval = 1, group = grpMa)
 
 grpScore = "Composite Classification"
-strongThresh = input.int(4, "Score >= this => Strong trend", minval = 1, maxval = 5, group = grpScore)
-weakThresh   = input.int(2, "Score >= this => Trend", minval = 1, maxval = 5, group = grpScore)
+strongThresh  = input.int(4, "Score >= this => Strong trend", minval = 1, maxval = 5, group = grpScore)
+weakThresh    = input.int(2, "Score >= this => Trend (entry threshold)", minval = 1, maxval = 5, group = grpScore)
+exitThresh    = input.int(0, "Leave a trend state when score crosses this (must be < weakThresh — the gap is the hysteresis dead zone)", minval = -4, maxval = 4, group = grpScore)
+confirmOnClose = input.bool(true, "Only update the state on closed bars (prevents intrabar signal flicker)", group = grpScore)
 
 grpDisp = "Display"
 showTable  = input.bool(true, "Show breakdown table", group = grpDisp)
@@ -94,9 +115,13 @@ voteADX = adxValue >= adxThreshold ? dmiDir : 0
 // -----------------------------------------------------------------------------
 // 3. Choppiness Index (E.W. Dreiss) — deterministic ranging filter
 // -----------------------------------------------------------------------------
+// A zero-range window makes CHOP undefined (0/0). Returning 0.0 here — as v1
+// did — is actively wrong: 0 is the *trending* end of the CHOP scale, so a
+// dead-flat window would have reported a perfect trend. na is the honest
+// answer, and it makes every downstream comparison false rather than bullish.
 chopRange    = ta.highest(high, chopLen) - ta.lowest(low, chopLen)
-chop         = chopRange != 0 ? 100 * math.log10(math.sum(ta.tr(true), chopLen) / chopRange) / math.log10(chopLen) : 0.0
-chopSideways = chop >= chopSidewaysMin
+chop         = chopRange > 0 ? 100 * math.log10(math.sum(ta.tr(true), chopLen) / chopRange) / math.log10(chopLen) : na
+chopSideways = not na(chop) and chop >= chopSidewaysMin
 
 // -----------------------------------------------------------------------------
 // 4. Swing structure — Dow Theory HH/HL vs LH/LL from confirmed pivots
@@ -162,19 +187,43 @@ voteMASlope = int(math.sign(maSlope))
 // -----------------------------------------------------------------------------
 rawScore = voteRegression + voteADX + voteStructure + voteStack + voteMASlope
 
-string trendState = "Sideways / Range"
-if chopOverride and chopSideways
-    trendState := "Sideways / Range"
-else if rawScore >= strongThresh
-    trendState := "Strong Uptrend"
-else if rawScore >= weakThresh
-    trendState := "Uptrend"
-else if rawScore <= -strongThresh
-    trendState := "Strong Downtrend"
-else if rawScore <= -weakThresh
-    trendState := "Downtrend"
-else
-    trendState := "Sideways / Range"
+// Choppiness gates *entering* a trend call; it never cancels one already
+// established (v2 fix c). Reported separately so the information is still
+// visible in the table.
+chopBlocksEntry = chopFilterEntries and chopSideways
+
+// The state is sticky across bars: entering a trend needs `weakThresh`,
+// leaving it needs the looser `exitThresh`, and the gap between them is the
+// hysteresis that stops one point of score noise from flipping the label
+// (v2 fix b). `mayUpdate` holds the state still until the bar closes, so a
+// signal cannot print mid-bar and then disappear (v2 fix a).
+var string trendState = "Sideways / Range"
+
+mayUpdate = not confirmOnClose or barstate.isconfirmed
+
+if mayUpdate
+    bool inUp   = trendState == "Uptrend" or trendState == "Strong Uptrend"
+    bool inDown = trendState == "Downtrend" or trendState == "Strong Downtrend"
+    if inUp
+        // Check the full reversal first: it also satisfies the exit test.
+        if rawScore <= -weakThresh
+            trendState := rawScore <= -strongThresh ? "Strong Downtrend" : "Downtrend"
+        else if rawScore <= exitThresh
+            trendState := "Sideways / Range"
+        else
+            trendState := rawScore >= strongThresh ? "Strong Uptrend" : "Uptrend"
+    else if inDown
+        if rawScore >= weakThresh
+            trendState := rawScore >= strongThresh ? "Strong Uptrend" : "Uptrend"
+        else if rawScore >= -exitThresh
+            trendState := "Sideways / Range"
+        else
+            trendState := rawScore <= -strongThresh ? "Strong Downtrend" : "Downtrend"
+    else if not chopBlocksEntry
+        if rawScore >= weakThresh
+            trendState := rawScore >= strongThresh ? "Strong Uptrend" : "Uptrend"
+        else if rawScore <= -weakThresh
+            trendState := rawScore <= -strongThresh ? "Strong Downtrend" : "Downtrend"
 
 strengthPct = math.abs(rawScore) / 5.0 * 100.0
 
@@ -211,7 +260,7 @@ plot(normSlope, "Regression slope (ATRs/bar)", display = display.data_window)
 // -----------------------------------------------------------------------------
 // Breakdown table
 // -----------------------------------------------------------------------------
-var table infoTable = table.new(position.top_right, 2, 10, border_width = 1)
+var table infoTable = table.new(position.top_right, 2, 11, border_width = 1)
 
 f_cell(t, row, label, value, valColor) =>
     table.cell(t, 0, row, label, text_color = color.white, bgcolor = color.new(color.black, 30), text_size = size.small)
@@ -227,16 +276,28 @@ if showTable and barstate.islast
     f_cell(infoTable, 4, "Reg. slope (ATRs)", str.tostring(normSlope, "#.###"), color.white)
     f_cell(infoTable, 5, "R-squared", str.tostring(rSquared, "#.##"), color.white)
     f_cell(infoTable, 6, "ADX / +DI / -DI", str.tostring(adxValue, "#.#") + " / " + str.tostring(plusDI, "#.#") + " / " + str.tostring(minusDI, "#.#"), color.white)
-    f_cell(infoTable, 7, "Choppiness", str.tostring(chop, "#.#"), chopSideways ? color.orange : color.white)
-    f_cell(infoTable, 8, "MA stack", voteStack == 1 ? "Bullish" : (voteStack == -1 ? "Bearish" : "Mixed"), color.white)
-    f_cell(infoTable, 9, "Swing structure", structureLabel, color.white)
+    f_cell(infoTable, 7, "Choppiness", na(chop) ? "n/a" : str.tostring(chop, "#.#"), chopSideways ? color.orange : color.white)
+    f_cell(infoTable, 8, "New entries", chopBlocksEntry ? "Blocked (choppy)" : "Clear", chopBlocksEntry ? color.orange : color.lime)
+    f_cell(infoTable, 9, "MA stack", voteStack == 1 ? "Bullish" : (voteStack == -1 ? "Bearish" : "Mixed"), color.white)
+    f_cell(infoTable, 10, "Swing structure", structureLabel, color.white)
 
 // -----------------------------------------------------------------------------
 // Alerts
 // -----------------------------------------------------------------------------
 trendChanged = trendState != trendState[1]
 
-alertcondition(trendChanged and (trendState == "Uptrend" or trendState == "Strong Uptrend"), title = "Entered Uptrend", message = "Deterministic Trend Detector: {{ticker}} entered an UPTREND on {{interval}}")
-alertcondition(trendChanged and (trendState == "Downtrend" or trendState == "Strong Downtrend"), title = "Entered Downtrend", message = "Deterministic Trend Detector: {{ticker}} entered a DOWNTREND on {{interval}}")
-alertcondition(trendChanged and trendState == "Sideways / Range", title = "Entered Sideways", message = "Deterministic Trend Detector: {{ticker}} entered SIDEWAYS/RANGE on {{interval}}")
-alertcondition(trendChanged, title = "Trend state changed", message = "Deterministic Trend Detector: {{ticker}} trend state changed on {{interval}}")
+// Direction-level edges, not label edges: v1 fired "entered an UPTREND" again
+// when the label merely upgraded Uptrend -> Strong Uptrend, which is a
+// strength change, not a regime change.
+isUp   = trendState == "Uptrend" or trendState == "Strong Uptrend"
+isDown = trendState == "Downtrend" or trendState == "Strong Downtrend"
+isFlat = trendState == "Sideways / Range"
+
+enteredUp   = isUp and not isUp[1]
+enteredDown = isDown and not isDown[1]
+enteredFlat = isFlat and not isFlat[1]
+
+alertcondition(enteredUp, title = "Entered Uptrend", message = "Deterministic Trend Detector: {{ticker}} entered an UPTREND on {{interval}}")
+alertcondition(enteredDown, title = "Entered Downtrend", message = "Deterministic Trend Detector: {{ticker}} entered a DOWNTREND on {{interval}}")
+alertcondition(enteredFlat, title = "Entered Sideways", message = "Deterministic Trend Detector: {{ticker}} entered SIDEWAYS/RANGE on {{interval}}")
+alertcondition(trendChanged, title = "Trend state changed (incl. strength)", message = "Deterministic Trend Detector: {{ticker}} trend state changed on {{interval}}")

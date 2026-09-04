@@ -105,10 +105,17 @@ cover very little net distance (CHOP near 100); a market trending in a
 straight line covers close to its full traveled distance as net displacement
 (CHOP near 0). The thresholds `61.8` and `38.2` are Fibonacci ratios chosen
 by the index's author as fixed calibration constants — they are not
-confidence levels or probabilities. By default (`chopOverride = true`), a
-CHOP reading at or above `chopSidewaysMin` forces the final label to
-"Sideways / Range" outright, since this index is specifically built to catch
-range conditions that slope/ADX can misread.
+confidence levels or probabilities. By default (`chopFilterEntries = true`), a
+CHOP reading at or above `chopSidewaysMin` blocks a *new* trend call, since
+this index is specifically built to catch range conditions that slope/ADX can
+misread. It does not cancel an already-established trend state — see the
+classification section below.
+
+One implementation note: the window's high-low range sits in the denominator,
+so a degenerate window where that range is exactly zero leaves CHOP undefined
+(0/0). The script returns `na` there rather than `0`, because `0` is the
+*trending* end of the CHOP scale — returning it would report a dead-flat
+window as a perfect trend.
 
 ### 4. Swing structure (Dow Theory)
 
@@ -148,21 +155,52 @@ long-term average's own direction. Both are plain arithmetic comparisons.
 ## Composite score and final classification
 
 The five votes (regression, ADX/DMI, structure, MA stack, MA slope), each in
-`{−1, 0, +1}`, are summed into a single integer `score ∈ [−5, +5]`. The final
-label is then assigned by fixed thresholds (defaults shown):
+`{−1, 0, +1}`, are summed into a single integer `score ∈ [−5, +5]`.
+
+The score is then run through a **sticky state machine with hysteresis**
+rather than being re-classified from scratch each bar. Entering a trend state
+requires the score to reach `weakThresh` (default 2); leaving one requires it
+to fall back to the separate, looser `exitThresh` (default 0). The gap between
+those two thresholds is a deterministic dead zone — a Schmitt trigger — and it
+exists because a single shared boundary (the original design) let one point of
+score noise flip the label back and forth on adjacent bars:
 
 ```
-Choppiness override active and CHOP ≥ 61.8      -> Sideways / Range
-score ≥ 4                                        -> Strong Uptrend
-score ≥ 2                                        -> Uptrend
-score ≤ −4                                        -> Strong Downtrend
-score ≤ −2                                        -> Downtrend
-otherwise                                         -> Sideways / Range
+state is Sideways, not choppy:
+    score ≥ +2  -> Uptrend      (≥ +4 -> Strong Uptrend)
+    score ≤ −2  -> Downtrend    (≤ −4 -> Strong Downtrend)
+
+state is an uptrend:
+    score ≤ −2  -> flip straight to the downtrend state
+    score ≤  0  -> Sideways / Range
+    otherwise    -> stay in the uptrend (Strong above +4, plain below)
+
+state is a downtrend: the mirror image of the above
 ```
+
+Two further rules govern *when* the machine may advance:
+
+- **Choppiness is an entry filter, not an override.** A CHOP reading at or
+  above `chopSidewaysMin` blocks a transition *out of* Sideways into a fresh
+  trend call, but never rewrites an already-established trend back to
+  Sideways. Collapsing both meanings into one label (the original design)
+  could hide a score-5 trend behind a transient chop spike during an ordinary
+  pullback. Chop status is reported separately in the table instead, so the
+  two distinct facts — "what the trend is" and "whether conditions favor a
+  fresh entry" — stay visible independently.
+- **Bar-close confirmation.** With `confirmOnClose` enabled (the default) the
+  state advances only on a closed bar, so a label or alert cannot appear
+  partway through a bar and then vanish before it closes. Historical bars are
+  always confirmed, so this makes the live reading match the historical one
+  rather than changing it.
 
 `strength% = |score| / 5 × 100` gives a magnitude reading independent of the
 label. All thresholds are exposed as script inputs so they can be tuned per
 instrument/timeframe without changing the underlying math.
+
+Note that hysteresis and bar-close confirmation are themselves deterministic
+constructs: a comparison against a second fixed threshold, and a check on
+whether the bar has closed. Neither introduces an estimated likelihood.
 
 ## Known limitations (disclosed, not hidden)
 

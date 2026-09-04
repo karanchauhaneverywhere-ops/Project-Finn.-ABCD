@@ -30,6 +30,14 @@
 //      side (typically shorts, in a persistently trending instrument) is the
 //      P&L drag.
 //
+// Shared with the indicator's v2 accuracy pass:
+//   - The displayed state now uses the same sticky, bar-close-confirmed
+//     state machine, so this chart's shading agrees with the indicator's
+//     label and with what the order logic is actually doing.
+//   - Bug fix: the Choppiness divide-by-zero guard returned 0.0, which is the
+//     *trending* end of the CHOP scale, so a dead-flat window reported a
+//     perfect trend. It now returns na.
+//
 // Risk sizing itself (fixed-fractional % of equity per trade) is unchanged
 // from v1 — a deterministic capital-allocation rule, not a probability-of-
 // win-based scheme such as the Kelly criterion. See ../METHODOLOGY.md for
@@ -60,8 +68,8 @@ adxThreshold = input.float(20.0, "ADX trend threshold", minval = 0, group = grpD
 
 grpChop = "Choppiness Index"
 chopLen         = input.int(14, "Choppiness length", minval = 2, group = grpChop)
-chopSidewaysMin = input.float(61.8, "Choppiness >= this => sideways", group = grpChop)
-chopOverride    = input.bool(true, "Let Choppiness force the 'Sideways' label", group = grpChop)
+chopSidewaysMin   = input.float(61.8, "Choppiness >= this => choppy", group = grpChop)
+chopFilterEntries = input.bool(true, "Choppiness blocks NEW entries (does not close an open position)", group = grpChop)
 
 grpStruct = "Swing Structure (Dow Theory)"
 pivotLeft  = input.int(5, "Pivot left bars", minval = 1, group = grpStruct)
@@ -125,9 +133,12 @@ voteADX = adxValue >= adxThreshold ? dmiDir : 0
 // -----------------------------------------------------------------------------
 // 3. Choppiness Index (E.W. Dreiss) — deterministic ranging filter
 // -----------------------------------------------------------------------------
+// A zero-range window leaves CHOP undefined (0/0). Returning 0.0 would be
+// wrong: 0 is the *trending* end of the scale, so a dead-flat window would
+// report a perfect trend. na makes every downstream comparison false instead.
 chopRange    = ta.highest(high, chopLen) - ta.lowest(low, chopLen)
-chop         = chopRange != 0 ? 100 * math.log10(math.sum(ta.tr(true), chopLen) / chopRange) / math.log10(chopLen) : 0.0
-chopSideways = chop >= chopSidewaysMin
+chop         = chopRange > 0 ? 100 * math.log10(math.sum(ta.tr(true), chopLen) / chopRange) / math.log10(chopLen) : na
+chopSideways = not na(chop) and chop >= chopSidewaysMin
 
 // -----------------------------------------------------------------------------
 // 4. Swing structure — Dow Theory HH/HL vs LH/LL from confirmed pivots
@@ -187,19 +198,36 @@ voteMASlope = int(math.sign(maSlope))
 // -----------------------------------------------------------------------------
 rawScore = voteRegression + voteADX + voteStructure + voteStack + voteMASlope
 
-string trendState = "Sideways / Range"
-if chopOverride and chopSideways
-    trendState := "Sideways / Range"
-else if rawScore >= strongThresh
-    trendState := "Strong Uptrend"
-else if rawScore >= weakThresh
-    trendState := "Uptrend"
-else if rawScore <= -strongThresh
-    trendState := "Strong Downtrend"
-else if rawScore <= -weakThresh
-    trendState := "Downtrend"
-else
-    trendState := "Sideways / Range"
+// Same sticky, hysteresis-based state machine the indicator uses, so the
+// background shading on this chart agrees with the indicator's label and with
+// what the order logic below actually does. Display only — the entry/exit
+// rules read `rawScore` directly.
+chopBlocksEntry = chopFilterEntries and chopSideways
+
+var string trendState = "Sideways / Range"
+
+if barstate.isconfirmed
+    bool inUp   = trendState == "Uptrend" or trendState == "Strong Uptrend"
+    bool inDown = trendState == "Downtrend" or trendState == "Strong Downtrend"
+    if inUp
+        if rawScore <= -weakThresh
+            trendState := rawScore <= -strongThresh ? "Strong Downtrend" : "Downtrend"
+        else if rawScore <= exitThresh
+            trendState := "Sideways / Range"
+        else
+            trendState := rawScore >= strongThresh ? "Strong Uptrend" : "Uptrend"
+    else if inDown
+        if rawScore >= weakThresh
+            trendState := rawScore >= strongThresh ? "Strong Uptrend" : "Uptrend"
+        else if rawScore >= -exitThresh
+            trendState := "Sideways / Range"
+        else
+            trendState := rawScore <= -strongThresh ? "Strong Downtrend" : "Downtrend"
+    else if not chopBlocksEntry
+        if rawScore >= weakThresh
+            trendState := rawScore >= strongThresh ? "Strong Uptrend" : "Uptrend"
+        else if rawScore <= -weakThresh
+            trendState := rawScore <= -strongThresh ? "Strong Downtrend" : "Downtrend"
 
 // -----------------------------------------------------------------------------
 // Optional higher-timeframe trend filter (v2, fix #4 infrastructure)
@@ -212,8 +240,6 @@ htfAllowsShort = not useHtfFilter or close < htfMA
 // -----------------------------------------------------------------------------
 // Trading rules (v2: hysteresis + chop-as-entry-filter, not exit-forcer)
 // -----------------------------------------------------------------------------
-chopBlocksEntry = chopOverride and chopSideways
-
 longQualifies  = allowLong  and htfAllowsLong  and not chopBlocksEntry and rawScore >= weakThresh
 shortQualifies = allowShort and htfAllowsShort and not chopBlocksEntry and rawScore <= -weakThresh
 

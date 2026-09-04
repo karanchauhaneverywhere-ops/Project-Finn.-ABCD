@@ -30,15 +30,36 @@ Five independent, deterministic components each cast a vote of `+1`
 1. **Regression slope + R²** — least-squares slope of price, ATR-normalized,
    trusted only when the fit is linear enough (R² above a threshold).
 2. **Wilder DMI/ADX** — classical directional-movement strength/direction.
-3. **Choppiness Index** — a ranging-market filter that can force a
-   "Sideways / Range" label outright.
+3. **Choppiness Index** — a ranging-market filter that blocks new trend calls
+   while conditions are choppy (it does not cancel an established trend).
 4. **Swing structure (Dow Theory)** — higher-highs/higher-lows vs
    lower-highs/lower-lows from confirmed pivots.
 5. **Moving-average geometry** — fast/mid/slow stack order + slow-MA slope.
 
-The five votes sum to a score from -5 to +5, which is mapped to a label by
-fixed thresholds (all tunable via script inputs). Every formula and
+The five votes sum to a score from -5 to +5, which drives a sticky state
+machine with hysteresis: entering a trend needs the score to reach
+`weakThresh`, leaving it needs the score to fall back to the looser
+`exitThresh`, and the state only advances on a closed bar. Every formula and
 threshold is documented in `METHODOLOGY.md`.
+
+### Signal-accuracy behavior (v2)
+
+Both scripts were revised to make the printed signal match the underlying
+math more honestly:
+
+- **No intrabar flicker.** With `confirmOnClose` on (default), the state
+  advances only on closed bars, so a label or alert can't appear mid-bar and
+  then disappear before the bar closes.
+- **Hysteresis instead of a single boundary.** One point of score noise no
+  longer flips the label (and fires an alert) on back-to-back bars.
+- **Choppiness filters entries, not established trends**, so a transient chop
+  spike during a pullback no longer hides a strong trend. The table reports
+  chop status separately under "New entries".
+- **Alerts fire on direction changes**, not strength upgrades — an
+  Uptrend → Strong Uptrend move no longer re-fires "entered an UPTREND".
+- **Bug fix:** a zero-range Choppiness window returned `0`, the *trending* end
+  of the scale, making a dead-flat window read as a perfect trend. It now
+  returns `na`.
 
 ## Using the indicator
 
