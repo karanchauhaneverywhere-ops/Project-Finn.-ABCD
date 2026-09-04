@@ -4,6 +4,29 @@ A single backtest number (e.g. "68% win rate on BTCUSD 1H, last 2 years")
 is close to meaningless on its own. Use this checklist before trusting or
 trading any strategy, including `strategy.pine`.
 
+## Indian markets specifics
+
+- **Data**: TradingView's NSE data for indices (NIFTY, BANKNIFTY, SENSEX,
+  FINNIFTY) and stocks is generally good for backtesting the underlying.
+  Backtesting actual **option premium** history requires an options-chain
+  data source Pine doesn't have natively — see `options-trading-notes.md`
+  for why the strategy backtests the underlying, not the option.
+- **Test across expiry cycles**, not just calendar time — weekly expiry
+  days (and the day after a big move) behave differently (higher
+  gap/whipsaw risk) from a normal mid-week session.
+- **Segment-specific volatility regimes**: backtest separately across at
+  least one strong trending period (e.g. a multi-month rally or selloff)
+  and one range-bound/choppy period (common in Indian indices between
+  major catalysts) — a strategy tuned only on a trending stretch will get
+  chopped up in the next range.
+- **Costs**: set commission/slippage to match your actual broker
+  (brokerage + STT + exchange charges + GST for the segment you trade —
+  intraday equity, F&O futures, and options each have different cost
+  structures) rather than the script's generic defaults.
+- **Circuit limits & liquidity**: illiquid stock options can gap through
+  stops — a backtested stop-loss price is not guaranteed to be your actual
+  fill in a fast or illiquid move.
+
 ## 1. Sample size
 
 - Require at least 100 closed trades in the backtest before drawing any

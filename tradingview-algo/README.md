@@ -1,71 +1,116 @@
-# Confluence Trend Strategy (CTS) — TradingView Algo Setup
+# Confluence Trend Strategy v2 (CTS2) — TradingView Algo Setup
 
-## Read this first: about "87% win rate"
+## Read this first: about "89% win rate, forced"
 
-No trading strategy — algorithmic or discretionary — can guarantee an 87%
-(or any fixed) success rate. Claims like that are marketing, not statistics
-that hold up on unseen future data. Two things this repo will **not** do:
+No trading strategy — algorithmic or discretionary — can guarantee an 89%
+(or any fixed) success rate, and no amount of Pine code can force one to be
+true in live markets. Claims like that are marketing, not statistics that
+hold up on unseen future data. Two things this repo will **not** do:
 
 - Ship a script tuned to show a high win rate on one historical chart
-  (that's overfitting, and it typically fails going forward).
-- Promise a specific return or win rate.
+  (that's overfitting, which is very likely part of why v1 failed live —
+  see "What changed in v2" below).
+- Fake it by using a take-profit so tight and a stop so wide that most
+  trades "win" a tiny amount right up until one loss wipes out the last
+  20 wins — a common trick vendors use to advertise high win rates while
+  the strategy is actually unprofitable.
 
 What it does instead: give you a transparent, adjustable, risk-managed
 strategy plus a real backtesting workflow, so you can measure its actual
-performance on the markets and timeframes you care about — and understand
-*why* the numbers are what they are. Good systematic strategies usually run
-40-60% win rate with a favorable risk/reward and positive expectancy, not
-80%+.
+performance on the markets and timeframes you care about. Good systematic
+strategies usually run 40-60% win rate with a favorable risk/reward and
+positive expectancy, not 80%+.
+
+## What changed in v2 (based on v1's real-time failure)
+
+v1 lost money, rarely traded, and entered late. Root causes and fixes:
+
+| Problem | v1 | v2 fix |
+|---|---|---|
+| Entries chased the move | Fired on EMA/MACD crossover bar itself | Waits for a pullback to EMA Fast + a confirming candle before entering |
+| Barely traded | Required *all* 6 filters to agree simultaneously | Confluence **score** (configurable, default 4-of-5) — trend is still mandatory, the rest just need to hit the threshold |
+| Losses outweighed wins | Pure ATR stop, no breakeven management | Structure-based stop (recent swing high/low, ATR floor) + move to breakeven and trail after +1R |
+| No account-level protection | None | Daily circuit breaker: max trades/session, max losses/session, max daily loss % — caps how bad a bad day can get, independent of the win rate |
+| Not built for Indian markets | Generic 24/7 script, no session logic | Default NSE session (09:15–15:00 entries, flatten by 15:30), session VWAP filter, expiry/near-close awareness |
+
+This is a genuine mechanism change, not a re-tuned version of the same
+crossover-chasing logic — but it still needs to be backtested and
+paper-traded on your actual instruments before you trust it (see
+`BACKTESTING_GUIDE.md`). If it still underperforms, tell me the actual
+numbers (win rate, profit factor, trade count, which instrument/timeframe)
+and I'll diagnose further — that's how this gets fixed for real, not by
+raising the promised number.
 
 ## What's in here
 
 | File | Purpose |
 |---|---|
-| `strategy.pine` | Pine Script v5 strategy — trend, momentum, volatility and volume confluence, ATR-based stops/targets, position sizing by % risk, optional trailing stop, webhook alerts. |
+| `strategy.pine` | Pine Script **v6** strategy — pullback entries, scored confluence (trend/momentum/VWAP/volume/no-chop), structure+ATR stops, breakeven/trailing management, daily circuit breaker, NSE session defaults, on-chart dashboard. |
 | `BACKTESTING_GUIDE.md` | How to backtest, walk-forward test, and paper-trade this (or any) strategy properly before using real money. |
+| `options-trading-notes.md` | **Read before trading options off these signals.** Why a spot-price backtest ≠ option premium P&L, and how to translate signals to strikes/expiry sensibly. |
 | `alert-webhook-template.json` | Payload format the strategy's `alert()` calls emit, for wiring into a broker/bot via TradingView webhooks. |
 
 ## How the strategy decides to trade
 
-It only enters when **all** of these agree (confluence — this is what
-keeps win rate honest instead of over-trading noise):
+Trend direction is mandatory (never trade against it); the other four
+signals are scored, and you need `minScore` of them (default 4 of 5) —
+this scoring, instead of v1's "all must agree," is what fixes the
+too-few-trades problem without dropping quality control:
 
-1. **Trend** — 21 EMA vs 50 EMA aligned, price on the correct side of the
-   200 EMA, and a higher timeframe (default 4H) confirms the same
-   direction.
-2. **Momentum** — MACD line vs signal line agrees with the trade direction,
-   RSI is on the correct side of 50 without being extended past 80/20.
-3. **Participation** — volume is at/above its 20-period average (filters
-   low-conviction moves).
-4. **Trend strength** — ADX above a threshold (default 20), filtering out
-   choppy/ranging conditions where trend systems get chopped up.
-5. **(Optional) Session** — restrict entries to a trading session.
+1. **Trend (mandatory)** — 21 EMA vs 50 EMA aligned, price on the correct
+   side of the 200 EMA, and a higher timeframe (default 1H) confirms the
+   same direction.
+2. **Momentum** — MACD line vs signal line agrees with direction *and* the
+   histogram is expanding, RSI is on the correct side of center without
+   being extended past 80/20.
+3. **Session VWAP** — price on the correct side of the day's VWAP (a
+   standard intraday index/options reference level).
+4. **Participation** — volume at/above its 20-period average.
+5. **Trend strength** — ADX above a threshold (default 18), filtering out
+   choppy/ranging conditions.
+
+Then it waits for a **pullback + confirmation candle** (price pulls back
+near the fast EMA, then a candle closes back in the trend direction)
+before entering — this is what fixes late/chasing entries.
 
 Risk management, not signal accuracy, is what makes the strategy viable:
 
 - Position size is calculated from a fixed **% of equity risked per
-  trade** (default 1%) divided by the ATR-based stop distance — not a
-  fixed share/contract count.
-- Stop loss = `ATR × multiplier` (default 1.5×) from entry.
-- Take profit = stop distance × reward:risk multiple (default 2×), so a
-  50% win rate here is already profitable before considering trend
-  continuation.
-- Optional ATR trailing stop kicks in once a trade is 1R in profit, to let
-  winners run.
+  trade** (default 1%) divided by the stop distance — not a fixed
+  share/contract/lot count.
+- Stop loss = the more conservative of a recent swing high/low or an ATR
+  floor, so normal noise doesn't clip the stop before the real move.
+- Take profit = stop distance × reward:risk multiple (default 1.8×).
+- Stop moves to breakeven at +1R, then trails by ATR — this directly
+  targets "losses outweighing wins" by capping how much a winner gives
+  back and taking bad trades off the table at zero once they've proven
+  themselves.
+- **Daily circuit breaker**: trading stops for the session after N trades,
+  N losses, or X% equity drawdown for the day — independent of what the
+  signals say. This is standard practice for Indian index/options
+  day-trading, where a few bad trades in a row can otherwise spiral.
+- Session defaults to NSE hours with entries cut off before 15:00 and a
+  forced flatten by 15:30 — relevant for intraday index/options trading
+  where holding into the close (or into expiry) carries extra risk.
 - A max-bars-in-trade exit closes trades that go nowhere.
+
+An on-chart dashboard (top-right) shows live long/short score, ADX,
+trades/losses today, and whether the circuit breaker has tripped, so you
+can see *why* it is or isn't taking a trade in real time.
 
 ## Setup on TradingView
 
 1. Open TradingView → **Pine Editor** (bottom panel).
 2. Create a new script, delete the boilerplate, and paste in the full
    contents of `strategy.pine`.
-3. Click **Add to Chart**. Open **Strategy Tester** (bottom panel) to see
-   backtest results (net profit, win rate, profit factor, max drawdown,
-   etc.) on the chart's symbol/timeframe.
-4. Use the gear icon on the indicator to adjust inputs (trend EMA lengths,
-   ATR multiples, risk %, session, long/short toggles) per market.
+3. Click **Add to Chart** on a NIFTY/BANKNIFTY/SENSEX or stock chart.
+   Open **Strategy Tester** (bottom panel) to see backtest results (net
+   profit, win rate, profit factor, max drawdown, etc.).
+4. Use the gear icon to adjust inputs — `minScore`, risk %, session
+   times, ADX threshold, long/short toggles — per instrument.
 5. Follow `BACKTESTING_GUIDE.md` before trusting any single backtest
-   number.
+   number, and read `options-trading-notes.md` before mapping signals to
+   option strikes.
 
 ## Turning signals into automated trades (optional)
 
