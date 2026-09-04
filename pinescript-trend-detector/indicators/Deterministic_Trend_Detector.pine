@@ -1,0 +1,242 @@
+//@version=6
+
+// =============================================================================
+// Deterministic Trend Detector
+// -----------------------------------------------------------------------------
+// Classifies the current market as Strong Uptrend / Uptrend / Sideways-Range /
+// Downtrend / Strong Downtrend using only closed-form deterministic math:
+//
+//   1. Least-squares regression slope (ATR-normalized) + R^2 (linearity)
+//   2. Wilder's Directional Movement Index / ADX
+//   3. The Choppiness Index (E.W. Dreiss)
+//   4. Swing-pivot market structure (Dow Theory: HH/HL vs LH/LL)
+//   5. Moving-average stack alignment + slow-MA slope
+//
+// Each component casts a vote in {-1, 0, +1} using a fixed, published formula
+// and a hard threshold. The five votes are summed into a composite score.
+// Nothing here is a probability, a statistical inference (p-value, confidence
+// interval, Bayesian posterior) or a machine-learning likelihood — see
+// ../METHODOLOGY.md for the full rationale and formulas.
+//
+// This script is for research/education. It is not financial advice.
+// =============================================================================
+indicator("Deterministic Trend Detector [Finn]", shorttitle = "DTD", overlay = true)
+
+// -----------------------------------------------------------------------------
+// Inputs
+// -----------------------------------------------------------------------------
+grpReg = "Regression (slope + linearity)"
+regLen      = input.int(34, "Regression length", minval = 5, group = grpReg)
+atrLen      = input.int(14, "ATR length (slope normalization)", minval = 1, group = grpReg)
+rSquaredMin = input.float(0.35, "Minimum R^2 to trust slope direction", minval = 0.0, maxval = 1.0, step = 0.05, group = grpReg)
+slopeMinATR = input.float(0.03, "Minimum |slope| in ATRs/bar", minval = 0.0, step = 0.01, group = grpReg)
+
+grpDmi = "Directional Movement (Wilder)"
+diLen        = input.int(14, "DI length", minval = 1, group = grpDmi)
+adxSmooth    = input.int(14, "ADX smoothing", minval = 1, group = grpDmi)
+adxThreshold = input.float(20.0, "ADX trend threshold", minval = 0, group = grpDmi)
+
+grpChop = "Choppiness Index"
+chopLen         = input.int(14, "Choppiness length", minval = 2, group = grpChop)
+chopSidewaysMin = input.float(61.8, "Choppiness >= this => sideways", group = grpChop)
+chopOverride    = input.bool(true, "Let Choppiness force the 'Sideways' label", group = grpChop)
+
+grpStruct = "Swing Structure (Dow Theory)"
+pivotLeft  = input.int(5, "Pivot left bars", minval = 1, group = grpStruct)
+pivotRight = input.int(5, "Pivot right bars", minval = 1, group = grpStruct)
+
+grpMa = "Moving Average Geometry"
+maType        = input.string("EMA", "MA type", options = ["EMA", "SMA", "WMA", "HMA", "RMA"], group = grpMa)
+fastLen       = input.int(21, "Fast MA length", minval = 1, group = grpMa)
+midLen        = input.int(55, "Mid MA length", minval = 1, group = grpMa)
+slowLen       = input.int(200, "Slow MA length", minval = 1, group = grpMa)
+slopeLookback = input.int(10, "Slow MA slope lookback", minval = 1, group = grpMa)
+
+grpScore = "Composite Classification"
+strongThresh = input.int(4, "Score >= this => Strong trend", minval = 1, maxval = 5, group = grpScore)
+weakThresh   = input.int(2, "Score >= this => Trend", minval = 1, maxval = 5, group = grpScore)
+
+grpDisp = "Display"
+showTable  = input.bool(true, "Show breakdown table", group = grpDisp)
+showBg     = input.bool(true, "Shade background by trend", group = grpDisp)
+showPivots = input.bool(true, "Mark confirmed swing pivots", group = grpDisp)
+
+// -----------------------------------------------------------------------------
+// 1. Least-squares regression: ATR-normalized slope + R^2 (linearity)
+// -----------------------------------------------------------------------------
+regNow  = ta.linreg(close, regLen, 0)
+regPrev = ta.linreg(close, regLen, 1)
+slope   = regNow - regPrev
+atrVal  = ta.atr(atrLen)
+normSlope = atrVal != 0 ? slope / atrVal : 0.0
+
+corr     = ta.correlation(close, bar_index, regLen)
+rSquared = math.pow(corr, 2)
+
+voteRegression = (rSquared >= rSquaredMin and math.abs(normSlope) >= slopeMinATR) ? int(math.sign(normSlope)) : 0
+
+// -----------------------------------------------------------------------------
+// 2. Wilder Directional Movement Index / ADX (manual closed-form calculation)
+// -----------------------------------------------------------------------------
+upMove   = high - high[1]
+downMove = low[1] - low
+plusDM   = (upMove > downMove and upMove > 0) ? upMove : 0.0
+minusDM  = (downMove > upMove and downMove > 0) ? downMove : 0.0
+trSmooth = ta.rma(ta.tr(true), diLen)
+plusDI   = trSmooth != 0 ? 100 * ta.rma(plusDM, diLen) / trSmooth : 0.0
+minusDI  = trSmooth != 0 ? 100 * ta.rma(minusDM, diLen) / trSmooth : 0.0
+dx       = (plusDI + minusDI) != 0 ? 100 * math.abs(plusDI - minusDI) / (plusDI + minusDI) : 0.0
+adxValue = ta.rma(dx, adxSmooth)
+
+dmiDir  = plusDI > minusDI ? 1 : (plusDI < minusDI ? -1 : 0)
+voteADX = adxValue >= adxThreshold ? dmiDir : 0
+
+// -----------------------------------------------------------------------------
+// 3. Choppiness Index (E.W. Dreiss) — deterministic ranging filter
+// -----------------------------------------------------------------------------
+chopRange    = ta.highest(high, chopLen) - ta.lowest(low, chopLen)
+chop         = chopRange != 0 ? 100 * math.log10(math.sum(ta.tr(true), chopLen) / chopRange) / math.log10(chopLen) : 0.0
+chopSideways = chop >= chopSidewaysMin
+
+// -----------------------------------------------------------------------------
+// 4. Swing structure — Dow Theory HH/HL vs LH/LL from confirmed pivots
+//    NOTE: a pivot only confirms `pivotRight` bars after it forms, so this
+//    component (and any label/plot driven by it) updates with that lag.
+// -----------------------------------------------------------------------------
+pivHigh = ta.pivothigh(pivotLeft, pivotRight)
+pivLow  = ta.pivotlow(pivotLeft, pivotRight)
+
+var float lastPH = na
+var float prevPH = na
+var float lastPL = na
+var float prevPL = na
+
+if not na(pivHigh)
+    prevPH := lastPH
+    lastPH := pivHigh
+if not na(pivLow)
+    prevPL := lastPL
+    lastPL := pivLow
+
+var int    voteStructure = 0
+var string structureLabel = "Undefined"
+
+if not na(lastPH) and not na(prevPH) and not na(lastPL) and not na(prevPL)
+    bool hh = lastPH > prevPH
+    bool hl = lastPL > prevPL
+    bool lh = lastPH < prevPH
+    bool ll = lastPL < prevPL
+    if hh and hl
+        voteStructure := 1
+        structureLabel := "HH / HL"
+    else if lh and ll
+        voteStructure := -1
+        structureLabel := "LH / LL"
+    else
+        voteStructure := 0
+        structureLabel := "Mixed"
+
+// -----------------------------------------------------------------------------
+// 5. Moving-average geometry: stack alignment + slow-MA slope
+// -----------------------------------------------------------------------------
+f_ma(src, len, kind) =>
+    switch kind
+        "EMA" => ta.ema(src, len)
+        "SMA" => ta.sma(src, len)
+        "WMA" => ta.wma(src, len)
+        "HMA" => ta.hma(src, len)
+        "RMA" => ta.rma(src, len)
+        => ta.ema(src, len)
+
+fastMA = f_ma(close, fastLen, maType)
+midMA  = f_ma(close, midLen, maType)
+slowMA = f_ma(close, slowLen, maType)
+
+voteStack = (fastMA > midMA and midMA > slowMA) ? 1 : ((fastMA < midMA and midMA < slowMA) ? -1 : 0)
+
+maSlope     = slowMA - slowMA[slopeLookback]
+voteMASlope = int(math.sign(maSlope))
+
+// -----------------------------------------------------------------------------
+// Composite score & classification
+// -----------------------------------------------------------------------------
+rawScore = voteRegression + voteADX + voteStructure + voteStack + voteMASlope
+
+string trendState = "Sideways / Range"
+if chopOverride and chopSideways
+    trendState := "Sideways / Range"
+else if rawScore >= strongThresh
+    trendState := "Strong Uptrend"
+else if rawScore >= weakThresh
+    trendState := "Uptrend"
+else if rawScore <= -strongThresh
+    trendState := "Strong Downtrend"
+else if rawScore <= -weakThresh
+    trendState := "Downtrend"
+else
+    trendState := "Sideways / Range"
+
+strengthPct = math.abs(rawScore) / 5.0 * 100.0
+
+var int barsInState = 0
+barsInState := (trendState == trendState[1]) ? barsInState + 1 : 0
+
+// -----------------------------------------------------------------------------
+// Visuals
+// -----------------------------------------------------------------------------
+plot(regNow, "Regression line", color = color.new(color.aqua, 0), linewidth = 2)
+plot(fastMA, "Fast MA", color = color.new(color.yellow, 0))
+plot(midMA, "Mid MA", color = color.new(color.orange, 0))
+plot(slowMA, "Slow MA", color = color.new(color.fuchsia, 0))
+
+bgColor = trendState == "Strong Uptrend" ? color.new(color.green, 75) :
+     trendState == "Uptrend" ? color.new(color.green, 88) :
+     trendState == "Strong Downtrend" ? color.new(color.red, 75) :
+     trendState == "Downtrend" ? color.new(color.red, 88) :
+     color.new(color.gray, 90)
+
+bgcolor(showBg ? bgColor : na)
+
+plotshape(showPivots and not na(pivHigh) ? pivHigh : na, title = "Pivot High", style = shape.triangledown, location = location.abovebar, color = color.red, offset = -pivotRight, size = size.tiny)
+plotshape(showPivots and not na(pivLow) ? pivLow : na, title = "Pivot Low", style = shape.triangleup, location = location.belowbar, color = color.green, offset = -pivotRight, size = size.tiny)
+
+// Numeric detail kept out of the visible chart, available in the Data Window
+plot(rawScore, "Composite score", display = display.data_window)
+plot(strengthPct, "Trend strength %", display = display.data_window)
+plot(adxValue, "ADX", display = display.data_window)
+plot(chop, "Choppiness", display = display.data_window)
+plot(rSquared, "R-squared", display = display.data_window)
+plot(normSlope, "Regression slope (ATRs/bar)", display = display.data_window)
+
+// -----------------------------------------------------------------------------
+// Breakdown table
+// -----------------------------------------------------------------------------
+var table infoTable = table.new(position.top_right, 2, 10, border_width = 1)
+
+f_cell(t, row, label, value, valColor) =>
+    table.cell(t, 0, row, label, text_color = color.white, bgcolor = color.new(color.black, 30), text_size = size.small)
+    table.cell(t, 1, row, value, text_color = valColor, bgcolor = color.new(color.black, 30), text_size = size.small)
+
+if showTable and barstate.islast
+    stateColor = (trendState == "Strong Uptrend" or trendState == "Uptrend") ? color.lime :
+         (trendState == "Strong Downtrend" or trendState == "Downtrend") ? color.red : color.silver
+    f_cell(infoTable, 0, "Trend State", trendState, stateColor)
+    f_cell(infoTable, 1, "Composite Score", str.tostring(rawScore) + " / 5", color.white)
+    f_cell(infoTable, 2, "Strength", str.tostring(strengthPct, "#.0") + "%", color.white)
+    f_cell(infoTable, 3, "Bars in state", str.tostring(barsInState), color.white)
+    f_cell(infoTable, 4, "Reg. slope (ATRs)", str.tostring(normSlope, "#.###"), color.white)
+    f_cell(infoTable, 5, "R-squared", str.tostring(rSquared, "#.##"), color.white)
+    f_cell(infoTable, 6, "ADX / +DI / -DI", str.tostring(adxValue, "#.#") + " / " + str.tostring(plusDI, "#.#") + " / " + str.tostring(minusDI, "#.#"), color.white)
+    f_cell(infoTable, 7, "Choppiness", str.tostring(chop, "#.#"), chopSideways ? color.orange : color.white)
+    f_cell(infoTable, 8, "MA stack", voteStack == 1 ? "Bullish" : (voteStack == -1 ? "Bearish" : "Mixed"), color.white)
+    f_cell(infoTable, 9, "Swing structure", structureLabel, color.white)
+
+// -----------------------------------------------------------------------------
+// Alerts
+// -----------------------------------------------------------------------------
+trendChanged = trendState != trendState[1]
+
+alertcondition(trendChanged and (trendState == "Uptrend" or trendState == "Strong Uptrend"), title = "Entered Uptrend", message = "Deterministic Trend Detector: {{ticker}} entered an UPTREND on {{interval}}")
+alertcondition(trendChanged and (trendState == "Downtrend" or trendState == "Strong Downtrend"), title = "Entered Downtrend", message = "Deterministic Trend Detector: {{ticker}} entered a DOWNTREND on {{interval}}")
+alertcondition(trendChanged and trendState == "Sideways / Range", title = "Entered Sideways", message = "Deterministic Trend Detector: {{ticker}} entered SIDEWAYS/RANGE on {{interval}}")
+alertcondition(trendChanged, title = "Trend state changed", message = "Deterministic Trend Detector: {{ticker}} trend state changed on {{interval}}")

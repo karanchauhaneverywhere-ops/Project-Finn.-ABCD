@@ -1,0 +1,287 @@
+//@version=6
+
+// =============================================================================
+// Deterministic Trend Strategy (v2 — whipsaw-reduction pass)
+// -----------------------------------------------------------------------------
+// Trades the same deterministic trend classification used by
+// ../indicators/Deterministic_Trend_Detector.pine (duplicated here because
+// TradingView strategy() and indicator() scripts cannot share a single
+// script file, and importing a Pine *library* requires it to be published
+// separately on TradingView first).
+//
+// v2 changes, aimed at the whipsaw/give-back costs that commonly produce
+// negative P&L in a naive trend-follower, all still closed-form/deterministic:
+//
+//   1. Entry/exit hysteresis: entries require the score to reach `weakThresh`,
+//      but an open position is only closed once the score falls back to
+//      `exitThresh` (a wider, separately-tunable dead zone) — not the instant
+//      it drops one point below the entry bar. This removes the single-bar
+//      "flip and flip back" whipsaw the v1 threshold shared for both.
+//   2. The Choppiness Index now only *blocks new entries*; it no longer force-
+//      closes an existing position. In v1, a transient chop spike during a
+//      pullback inside a strong trend would flatten the position outright.
+//   3. A chandelier-style ATR trailing stop replaces the static stop. It only
+//      ratchets in the trade's favor (never loosens), so it both bounds
+//      initial risk and locks in open profit instead of relying solely on
+//      the lagging score-flip exit.
+//   4. An optional higher-timeframe trend filter (off by default) can require
+//      price to be above/below a higher-timeframe EMA before allowing longs/
+//      shorts respectively — useful if a Strategy Tester breakdown shows one
+//      side (typically shorts, in a persistently trending instrument) is the
+//      P&L drag.
+//
+// Risk sizing itself (fixed-fractional % of equity per trade) is unchanged
+// from v1 — a deterministic capital-allocation rule, not a probability-of-
+// win-based scheme such as the Kelly criterion. See ../METHODOLOGY.md for
+// the full rationale behind the "no probability assumptions" design.
+//
+// This script is for research/education. It is not financial advice.
+// Backtest results do not guarantee future performance.
+// =============================================================================
+strategy("Deterministic Trend Strategy [Finn]", shorttitle = "DTS", overlay = true,
+     initial_capital = 10000,
+     default_qty_type = strategy.percent_of_equity, default_qty_value = 10,
+     commission_type = strategy.commission.percent, commission_value = 0.05,
+     slippage = 1, process_orders_on_close = true)
+
+// -----------------------------------------------------------------------------
+// Inputs
+// -----------------------------------------------------------------------------
+grpReg = "Regression (slope + linearity)"
+regLen      = input.int(34, "Regression length", minval = 5, group = grpReg)
+atrLen      = input.int(14, "ATR length (slope normalization + stops)", minval = 1, group = grpReg)
+rSquaredMin = input.float(0.35, "Minimum R^2 to trust slope direction", minval = 0.0, maxval = 1.0, step = 0.05, group = grpReg)
+slopeMinATR = input.float(0.03, "Minimum |slope| in ATRs/bar", minval = 0.0, step = 0.01, group = grpReg)
+
+grpDmi = "Directional Movement (Wilder)"
+diLen        = input.int(14, "DI length", minval = 1, group = grpDmi)
+adxSmooth    = input.int(14, "ADX smoothing", minval = 1, group = grpDmi)
+adxThreshold = input.float(20.0, "ADX trend threshold", minval = 0, group = grpDmi)
+
+grpChop = "Choppiness Index"
+chopLen         = input.int(14, "Choppiness length", minval = 2, group = grpChop)
+chopSidewaysMin = input.float(61.8, "Choppiness >= this => sideways", group = grpChop)
+chopOverride    = input.bool(true, "Let Choppiness force the 'Sideways' label", group = grpChop)
+
+grpStruct = "Swing Structure (Dow Theory)"
+pivotLeft  = input.int(5, "Pivot left bars", minval = 1, group = grpStruct)
+pivotRight = input.int(5, "Pivot right bars", minval = 1, group = grpStruct)
+
+grpMa = "Moving Average Geometry"
+maType        = input.string("EMA", "MA type", options = ["EMA", "SMA", "WMA", "HMA", "RMA"], group = grpMa)
+fastLen       = input.int(21, "Fast MA length", minval = 1, group = grpMa)
+midLen        = input.int(55, "Mid MA length", minval = 1, group = grpMa)
+slowLen       = input.int(200, "Slow MA length", minval = 1, group = grpMa)
+slopeLookback = input.int(10, "Slow MA slope lookback", minval = 1, group = grpMa)
+
+grpScore = "Composite Classification"
+strongThresh = input.int(4, "Score >= this => Strong trend", minval = 1, maxval = 5, group = grpScore)
+weakThresh   = input.int(2, "Score >= this => Trend", minval = 1, maxval = 5, group = grpScore)
+
+grpTrade = "Trading Rules"
+allowLong   = input.bool(true, "Allow long entries", group = grpTrade)
+allowShort  = input.bool(true, "Allow short entries", group = grpTrade)
+exitThresh  = input.int(0, "Exit when score crosses this (must be < weakThresh — the gap is the hysteresis dead zone)", minval = -4, maxval = 4, group = grpTrade)
+atrStopMult = input.float(2.5, "Initial risk & chandelier trail, in ATRs", minval = 0.5, step = 0.5, group = grpTrade)
+
+grpHtf = "Higher-Timeframe Filter (optional, off by default)"
+useHtfFilter = input.bool(false, "Require higher-timeframe trend alignment", group = grpHtf)
+htfRes       = input.timeframe("D", "Higher timeframe", group = grpHtf)
+htfMaLen     = input.int(50, "Higher-timeframe EMA length", minval = 1, group = grpHtf)
+
+grpDisp = "Display"
+showBg = input.bool(true, "Shade background by trend", group = grpDisp)
+
+// -----------------------------------------------------------------------------
+// 1. Least-squares regression: ATR-normalized slope + R^2 (linearity)
+// -----------------------------------------------------------------------------
+regNow  = ta.linreg(close, regLen, 0)
+regPrev = ta.linreg(close, regLen, 1)
+slope   = regNow - regPrev
+atrVal  = ta.atr(atrLen)
+normSlope = atrVal != 0 ? slope / atrVal : 0.0
+
+corr     = ta.correlation(close, bar_index, regLen)
+rSquared = math.pow(corr, 2)
+
+voteRegression = (rSquared >= rSquaredMin and math.abs(normSlope) >= slopeMinATR) ? int(math.sign(normSlope)) : 0
+
+// -----------------------------------------------------------------------------
+// 2. Wilder Directional Movement Index / ADX (manual closed-form calculation)
+// -----------------------------------------------------------------------------
+upMove   = high - high[1]
+downMove = low[1] - low
+plusDM   = (upMove > downMove and upMove > 0) ? upMove : 0.0
+minusDM  = (downMove > upMove and downMove > 0) ? downMove : 0.0
+trSmooth = ta.rma(ta.tr(true), diLen)
+plusDI   = trSmooth != 0 ? 100 * ta.rma(plusDM, diLen) / trSmooth : 0.0
+minusDI  = trSmooth != 0 ? 100 * ta.rma(minusDM, diLen) / trSmooth : 0.0
+dx       = (plusDI + minusDI) != 0 ? 100 * math.abs(plusDI - minusDI) / (plusDI + minusDI) : 0.0
+adxValue = ta.rma(dx, adxSmooth)
+
+dmiDir  = plusDI > minusDI ? 1 : (plusDI < minusDI ? -1 : 0)
+voteADX = adxValue >= adxThreshold ? dmiDir : 0
+
+// -----------------------------------------------------------------------------
+// 3. Choppiness Index (E.W. Dreiss) — deterministic ranging filter
+// -----------------------------------------------------------------------------
+chopRange    = ta.highest(high, chopLen) - ta.lowest(low, chopLen)
+chop         = chopRange != 0 ? 100 * math.log10(math.sum(ta.tr(true), chopLen) / chopRange) / math.log10(chopLen) : 0.0
+chopSideways = chop >= chopSidewaysMin
+
+// -----------------------------------------------------------------------------
+// 4. Swing structure — Dow Theory HH/HL vs LH/LL from confirmed pivots
+// -----------------------------------------------------------------------------
+pivHigh = ta.pivothigh(pivotLeft, pivotRight)
+pivLow  = ta.pivotlow(pivotLeft, pivotRight)
+
+var float lastPH = na
+var float prevPH = na
+var float lastPL = na
+var float prevPL = na
+
+if not na(pivHigh)
+    prevPH := lastPH
+    lastPH := pivHigh
+if not na(pivLow)
+    prevPL := lastPL
+    lastPL := pivLow
+
+var int voteStructure = 0
+
+if not na(lastPH) and not na(prevPH) and not na(lastPL) and not na(prevPL)
+    bool hh = lastPH > prevPH
+    bool hl = lastPL > prevPL
+    bool lh = lastPH < prevPH
+    bool ll = lastPL < prevPL
+    if hh and hl
+        voteStructure := 1
+    else if lh and ll
+        voteStructure := -1
+    else
+        voteStructure := 0
+
+// -----------------------------------------------------------------------------
+// 5. Moving-average geometry: stack alignment + slow-MA slope
+// -----------------------------------------------------------------------------
+f_ma(src, len, kind) =>
+    switch kind
+        "EMA" => ta.ema(src, len)
+        "SMA" => ta.sma(src, len)
+        "WMA" => ta.wma(src, len)
+        "HMA" => ta.hma(src, len)
+        "RMA" => ta.rma(src, len)
+        => ta.ema(src, len)
+
+fastMA = f_ma(close, fastLen, maType)
+midMA  = f_ma(close, midLen, maType)
+slowMA = f_ma(close, slowLen, maType)
+
+voteStack = (fastMA > midMA and midMA > slowMA) ? 1 : ((fastMA < midMA and midMA < slowMA) ? -1 : 0)
+
+maSlope     = slowMA - slowMA[slopeLookback]
+voteMASlope = int(math.sign(maSlope))
+
+// -----------------------------------------------------------------------------
+// Composite score & classification (unchanged engine; still drives display)
+// -----------------------------------------------------------------------------
+rawScore = voteRegression + voteADX + voteStructure + voteStack + voteMASlope
+
+string trendState = "Sideways / Range"
+if chopOverride and chopSideways
+    trendState := "Sideways / Range"
+else if rawScore >= strongThresh
+    trendState := "Strong Uptrend"
+else if rawScore >= weakThresh
+    trendState := "Uptrend"
+else if rawScore <= -strongThresh
+    trendState := "Strong Downtrend"
+else if rawScore <= -weakThresh
+    trendState := "Downtrend"
+else
+    trendState := "Sideways / Range"
+
+// -----------------------------------------------------------------------------
+// Optional higher-timeframe trend filter (v2, fix #4 infrastructure)
+// lookahead_off avoids using an HTF bar that hasn't closed yet on this chart.
+// -----------------------------------------------------------------------------
+htfMA = request.security(syminfo.tickerid, htfRes, ta.ema(close, htfMaLen), lookahead = barmerge.lookahead_off)
+htfAllowsLong  = not useHtfFilter or close > htfMA
+htfAllowsShort = not useHtfFilter or close < htfMA
+
+// -----------------------------------------------------------------------------
+// Trading rules (v2: hysteresis + chop-as-entry-filter, not exit-forcer)
+// -----------------------------------------------------------------------------
+chopBlocksEntry = chopOverride and chopSideways
+
+longQualifies  = allowLong  and htfAllowsLong  and not chopBlocksEntry and rawScore >= weakThresh
+shortQualifies = allowShort and htfAllowsShort and not chopBlocksEntry and rawScore <= -weakThresh
+
+// Rising edge: fires on a fresh score cross into qualifying territory, or on
+// chop clearing while the score already qualifies — either way, only once.
+longCondition  = longQualifies  and not longQualifies[1]
+shortCondition = shortQualifies and not shortQualifies[1]
+
+// Exit uses its own (looser) threshold, independent of Choppiness, so a
+// position survives the same transient noise that would have blocked a
+// fresh entry. exitThresh should be set below weakThresh to create a dead
+// zone between "would enter" and "gives up" — that gap is the hysteresis.
+exitLongCondition  = strategy.position_size > 0 and rawScore <= exitThresh
+exitShortCondition = strategy.position_size < 0 and rawScore >= -exitThresh
+
+if longCondition
+    strategy.entry("Long", strategy.long)
+if shortCondition
+    strategy.entry("Short", strategy.short)
+
+if exitLongCondition
+    strategy.close("Long", comment = "Score exit")
+if exitShortCondition
+    strategy.close("Short", comment = "Score exit")
+
+// -----------------------------------------------------------------------------
+// Chandelier-style ATR trailing stop (v2, fix #3): seeded at entry, then only
+// ever ratchets in the trade's favor — bounds initial risk AND locks in open
+// profit, instead of relying solely on the lagging score-flip exit above.
+// -----------------------------------------------------------------------------
+longJustEntered  = strategy.position_size > 0 and strategy.position_size[1] <= 0
+shortJustEntered = strategy.position_size < 0 and strategy.position_size[1] >= 0
+
+var float longStopLevel  = na
+var float shortStopLevel = na
+
+if longJustEntered
+    longStopLevel := high - atrStopMult * atrVal
+else if strategy.position_size > 0
+    longStopLevel := math.max(longStopLevel, high - atrStopMult * atrVal)
+
+if shortJustEntered
+    shortStopLevel := low + atrStopMult * atrVal
+else if strategy.position_size < 0
+    shortStopLevel := math.min(shortStopLevel, low + atrStopMult * atrVal)
+
+if strategy.position_size > 0
+    strategy.exit("Long stop", "Long", stop = longStopLevel)
+if strategy.position_size < 0
+    strategy.exit("Short stop", "Short", stop = shortStopLevel)
+
+// -----------------------------------------------------------------------------
+// Visuals
+// -----------------------------------------------------------------------------
+plot(fastMA, "Fast MA", color = color.new(color.yellow, 0))
+plot(midMA, "Mid MA", color = color.new(color.orange, 0))
+plot(slowMA, "Slow MA", color = color.new(color.fuchsia, 0))
+
+bgColor = trendState == "Strong Uptrend" ? color.new(color.green, 75) :
+     trendState == "Uptrend" ? color.new(color.green, 88) :
+     trendState == "Strong Downtrend" ? color.new(color.red, 75) :
+     trendState == "Downtrend" ? color.new(color.red, 88) :
+     color.new(color.gray, 90)
+
+bgcolor(showBg ? bgColor : na)
+
+plot(rawScore, "Composite score", display = display.data_window)
+plot(adxValue, "ADX", display = display.data_window)
+plot(chop, "Choppiness", display = display.data_window)
+plot(strategy.position_size > 0 ? longStopLevel : na, "Long chandelier stop", color = color.new(color.red, 0), style = plot.style_linebr)
+plot(strategy.position_size < 0 ? shortStopLevel : na, "Short chandelier stop", color = color.new(color.red, 0), style = plot.style_linebr)
