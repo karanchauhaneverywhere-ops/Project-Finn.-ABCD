@@ -31,6 +31,18 @@
 // 1.15R) so the trade has room to reach target before the trail can
 // interfere, and is wider (2.0x ATR) so normal noise doesn't trigger it.
 //
+// v2.2 — self-review fix (no live data involved, found by tracing the
+// code): position sizing computed qty = riskCapital / stopDistance
+// directly, without dividing by syminfo.pointvalue. That's only correct
+// on a spot/equity chart (pointvalue 1); on a real futures contract
+// (e.g. NIFTY/BANKNIFTY, where pointvalue = the lot's per-point value),
+// Pine's actual fill math is qty x price_change x pointvalue, so the
+// old formula silently risked riskCapital x pointvalue per trade instead
+// of riskCapital — a large, latent over-leverage bug that hadn't shown
+// up yet only because prior testing was on a spot/index chart. Fixed,
+// and quantity is now floored to whole contracts with entries skipped
+// (not fired at a broken size) when that rounds to zero.
+//
 // This still does not target or guarantee any fixed win rate — see
 // tradingview-algo/README.md for why, and tradingview-algo/BACKTESTING_GUIDE.md
 // for how to validate this on real NSE data before risking capital.
@@ -60,7 +72,7 @@ strategy(
 // INPUTS
 // ---------------------------------------------------------------------------
 grp_trend = "Trend Filter"
-htfRes      = input.timeframe("60", "Higher timeframe (trend filter)", group = grp_trend)
+htfRes      = input.timeframe("60", "Higher timeframe (trend filter) — must be higher than your chart's own timeframe", group = grp_trend)
 emaFastLen  = input.int(21,  "EMA Fast", group = grp_trend)
 emaSlowLen  = input.int(50,  "EMA Slow", group = grp_trend)
 emaTrendLen = input.int(200, "EMA Trend (macro filter)", group = grp_trend)
@@ -213,7 +225,16 @@ if (maxTradesPerDay > 0 and tradesToday >= maxTradesPerDay) or
 canTrade = not circuitTripped
 
 // ---------------------------------------------------------------------------
-// POSITION SIZING — fixed % of equity risked per trade, based on stop distance
+// POSITION SIZING — fixed % of equity risked per trade, based on stop
+// distance, sized in WHOLE CONTRACTS using syminfo.pointvalue. Without
+// dividing by pointvalue, the risked capital would silently be
+// riskCapital x pointvalue instead of riskCapital on any instrument where
+// 1 point isn't worth exactly 1 currency unit per contract (e.g. NIFTY/
+// BANKNIFTY futures) — a large, silent over-leverage bug. On a plain
+// index/spot chart pointvalue is 1, so this is a no-op there. Quantity is
+// floored because fractional lots aren't tradable; freshLong/freshShort's
+// entry is gated on the result being >0 so a trade this small is skipped
+// instead of firing with a broken size.
 // ---------------------------------------------------------------------------
 swingLow  = ta.lowest(low, swingLookback)
 swingHigh = ta.highest(high, swingLookback)
@@ -222,8 +243,8 @@ longStopDistance  = math.max(close - swingLow,  atrVal * atrStopFloorMult)
 shortStopDistance = math.max(swingHigh - close, atrVal * atrStopFloorMult)
 
 riskCapital = strategy.equity * (riskPerTradePct / 100)
-longQty     = longStopDistance  > 0 ? riskCapital / longStopDistance  : 0.0
-shortQty    = shortStopDistance > 0 ? riskCapital / shortStopDistance : 0.0
+longQty     = longStopDistance  > 0 ? math.floor(riskCapital / (longStopDistance  * syminfo.pointvalue)) : 0.0
+shortQty    = shortStopDistance > 0 ? math.floor(riskCapital / (shortStopDistance * syminfo.pointvalue)) : 0.0
 
 // ---------------------------------------------------------------------------
 // ORDERS
@@ -236,14 +257,14 @@ var float longRDist      = na
 var float shortRDist     = na
 var int   entryBarIndex  = na
 
-if freshLong and canTrade
+if freshLong and canTrade and longQty > 0
     longStopPrice := close - longStopDistance
     longTPPrice   := close + longStopDistance * rewardRiskMult
     longRDist     := longStopDistance
     strategy.entry("Long", strategy.long, qty = longQty)
     entryBarIndex := bar_index
 
-if freshShort and canTrade
+if freshShort and canTrade and shortQty > 0
     shortStopPrice := close + shortStopDistance
     shortTPPrice   := close - shortStopDistance * rewardRiskMult
     shortRDist      := shortStopDistance
@@ -276,10 +297,10 @@ if inEodWindow and strategy.position_size != 0
 // ---------------------------------------------------------------------------
 // ALERTS — for webhook automation (see alert-webhook-template.json)
 // ---------------------------------------------------------------------------
-if freshLong and canTrade
+if freshLong and canTrade and longQty > 0
     alert('{"action":"buy","symbol":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"stop":' + str.tostring(longStopPrice) + ',"target":' + str.tostring(longTPPrice) + '}', alert.freq_once_per_bar_close)
 
-if freshShort and canTrade
+if freshShort and canTrade and shortQty > 0
     alert('{"action":"sell","symbol":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"stop":' + str.tostring(shortStopPrice) + ',"target":' + str.tostring(shortTPPrice) + '}', alert.freq_once_per_bar_close)
 
 // ---------------------------------------------------------------------------
