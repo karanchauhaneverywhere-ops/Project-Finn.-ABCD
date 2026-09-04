@@ -101,6 +101,18 @@ grpDisp = "Display"
 showBg = input.bool(true, "Shade background by trend", group = grpDisp)
 
 // -----------------------------------------------------------------------------
+// Input validation (E4, E7, E8)
+// -----------------------------------------------------------------------------
+// These combinations are silently destructive rather than merely suboptimal,
+// so they fail loudly instead of producing plausible-looking nonsense.
+if exitThresh >= weakThresh
+    runtime.error("Exit threshold (" + str.tostring(exitThresh) + ") must be BELOW the trend entry threshold (" + str.tostring(weakThresh) + "). With exit >= entry there is no hysteresis dead zone: a position is opened and closed on alternating bars.")
+if weakThresh > strongThresh
+    runtime.error("Trend entry threshold (" + str.tostring(weakThresh) + ") must not exceed the strong-trend threshold (" + str.tostring(strongThresh) + "), or every trend is labelled 'Strong'.")
+if useHtfFilter and timeframe.in_seconds(htfRes) < timeframe.in_seconds(timeframe.period)
+    runtime.error("The higher timeframe (" + htfRes + ") is lower than the chart timeframe. Pick a timeframe at or above the chart's, or disable the filter.")
+
+// -----------------------------------------------------------------------------
 // 1. Least-squares regression: ATR-normalized slope + R^2 (linearity)
 // -----------------------------------------------------------------------------
 regNow  = ta.linreg(close, regLen, 0)
@@ -190,8 +202,11 @@ slowMA = f_ma(close, slowLen, maType)
 
 voteStack = (fastMA > midMA and midMA > slowMA) ? 1 : ((fastMA < midMA and midMA < slowMA) ? -1 : 0)
 
-maSlope     = slowMA - slowMA[slopeLookback]
-voteMASlope = int(math.sign(maSlope))
+maSlope = slowMA - slowMA[slopeLookback]
+// E1: rawScore is a SUM, so an unguarded na here nullifies the whole score and
+// pins the classifier to "Sideways" for the entire ~210-bar warmup. Every other
+// vote already falls back to 0 when its input isn't ready; this one must too.
+voteMASlope = na(maSlope) ? 0 : int(math.sign(maSlope))
 
 // -----------------------------------------------------------------------------
 // Composite score & classification (unchanged engine; still drives display)
@@ -233,9 +248,21 @@ if barstate.isconfirmed
 // Optional higher-timeframe trend filter (v2, fix #4 infrastructure)
 // lookahead_off avoids using an HTF bar that hasn't closed yet on this chart.
 // -----------------------------------------------------------------------------
-htfMA = request.security(syminfo.tickerid, htfRes, ta.ema(close, htfMaLen), lookahead = barmerge.lookahead_off)
-htfAllowsLong  = not useHtfFilter or close > htfMA
-htfAllowsShort = not useHtfFilter or close < htfMA
+// E6: requesting the raw expression returns the *forming* higher-timeframe bar
+// on the realtime bar but the last *completed* one over history, so a live
+// signal need not reproduce once the bar becomes history. Requesting [1] pins
+// it to the last confirmed HTF bar in both cases — one HTF bar of extra lag
+// bought in exchange for a signal that doesn't rewrite itself.
+htfMA = request.security(syminfo.tickerid, htfRes, ta.ema(close, htfMaLen)[1], lookahead = barmerge.lookahead_off)
+
+// E5: htfMA is na until the higher timeframe has htfMaLen bars (50 DAILY bars
+// by default). `close > na` is false, so leaving this implicit silently blocked
+// every entry during that warmup and looked like "the strategy doesn't trade".
+// Blocking is still the correct call — alignment cannot be verified — but it is
+// now explicit, and htfReady is surfaced rather than hidden.
+htfReady       = not na(htfMA)
+htfAllowsLong  = not useHtfFilter or (htfReady and close > htfMA)
+htfAllowsShort = not useHtfFilter or (htfReady and close < htfMA)
 
 // -----------------------------------------------------------------------------
 // Trading rules (v2: hysteresis + chop-as-entry-filter, not exit-forcer)
@@ -266,29 +293,41 @@ if exitShortCondition
     strategy.close("Short", comment = "Score exit")
 
 // -----------------------------------------------------------------------------
-// Chandelier-style ATR trailing stop (v2, fix #3): seeded at entry, then only
-// ever ratchets in the trade's favor — bounds initial risk AND locks in open
-// profit, instead of relying solely on the lagging score-flip exit above.
+// Chandelier-style ATR trailing stop: bounds initial risk AND locks in open
+// profit, rather than relying solely on the lagging score-flip exit above.
 // -----------------------------------------------------------------------------
-longJustEntered  = strategy.position_size > 0 and strategy.position_size[1] <= 0
-shortJustEntered = strategy.position_size < 0 and strategy.position_size[1] >= 0
-
+// E2/E3: this previously keyed off `strategy.position_size`, which with
+// process_orders_on_close = true still reads 0 throughout the bar that places
+// the entry — the fill lands at that bar's close, after the script has run. So
+// the old `longJustEntered` test was true a bar LATE: the stop was seeded from
+// the wrong bar's high and ATR, and, worse, no strategy.exit order existed at
+// all while the position's first bar traded. A gap straight after entry was
+// completely unprotected, in a system whose entire edge is cutting losers small.
+//
+// Keying off the order-placement condition instead seeds the stop from the bar
+// the decision is made on and submits the protective order in the same breath.
+// strategy.exit() attaches to the entry ID and waits for the fill, so the stop
+// is live from the position's very first bar. This also realigns the level with
+// the indicator's overlay, which always seeded on the entry bar.
 var float longStopLevel  = na
 var float shortStopLevel = na
 
-if longJustEntered
+// The `position_size <= 0` guard matters: longCondition can fire again while
+// already long (score dips to 1 without reaching exitThresh, then recrosses to
+// 2), and re-seeding there would LOOSEN a stop that has already ratcheted up.
+// Only a genuinely new position seeds; everything else can only tighten.
+if longCondition and strategy.position_size <= 0
     longStopLevel := high - atrStopMult * atrVal
+    strategy.exit("Long stop", "Long", stop = longStopLevel)
 else if strategy.position_size > 0
     longStopLevel := math.max(longStopLevel, high - atrStopMult * atrVal)
+    strategy.exit("Long stop", "Long", stop = longStopLevel)
 
-if shortJustEntered
+if shortCondition and strategy.position_size >= 0
     shortStopLevel := low + atrStopMult * atrVal
+    strategy.exit("Short stop", "Short", stop = shortStopLevel)
 else if strategy.position_size < 0
     shortStopLevel := math.min(shortStopLevel, low + atrStopMult * atrVal)
-
-if strategy.position_size > 0
-    strategy.exit("Long stop", "Long", stop = longStopLevel)
-if strategy.position_size < 0
     strategy.exit("Short stop", "Short", stop = shortStopLevel)
 
 // -----------------------------------------------------------------------------

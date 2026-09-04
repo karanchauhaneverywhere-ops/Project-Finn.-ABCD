@@ -1,9 +1,36 @@
 # Code audit — known errors and defects
 
 Findings from a line-by-line review of both scripts, ordered by severity.
-Nothing here has been fixed yet; this is the working list.
+Line references below are as of commit `11af58b`, when the audit was written.
 
-Line references are as of commit `11af58b`.
+## Status
+
+| # | Issue | Status |
+|---|-------|--------|
+| E1 | `voteMASlope` unguarded `na` nullifies the score | **Fixed** |
+| E2 | Indicator's drawn stop ≠ strategy's real stop | **Fixed** (via E3) |
+| E3 | Position unprotected on its first bar | **Fixed** |
+| E4 | `exitThresh >= weakThresh` unguarded | **Fixed** — `runtime.error` |
+| E5 | HTF filter silently blocks entries while warming | **Fixed** — explicit + reported |
+| E6 | HTF filter repaint vector | **Fixed** — requests `[1]` |
+| E7 | No guard on HTF lower than chart TF | **Fixed** — `runtime.error` |
+| E8 | `weakThresh > strongThresh` unguarded | **Fixed** — `runtime.error` |
+| E9 | `NaN` in table during warmup | **Fixed** (via E1) |
+| E10 | Overlay models no costs | Open — inherent, documented |
+| E11 | Engine duplicated across both files | Open — needs a Pine library |
+
+A regression was introduced and caught while fixing E3: keying the stop off
+`longCondition` alone meant a re-fire *while already long* (score dips to 1
+without reaching `exitThresh`, then recrosses to 2) would re-seed and
+**loosen** an already-ratcheted stop. Guarded with `strategy.position_size <= 0`
+so only a genuinely new position seeds.
+
+**None of this has been compiled.** There is no Pine compiler in the
+development environment. In particular, the E3 fix relies on `strategy.exit()`
+accepting a `from_entry` whose entry order was placed in the same script
+execution and holding it until that entry fills. That is the documented
+behaviour, but it is unverified here — check the Strategy Tester's trade list
+shows a stop exit available from each trade's first bar.
 
 ---
 
