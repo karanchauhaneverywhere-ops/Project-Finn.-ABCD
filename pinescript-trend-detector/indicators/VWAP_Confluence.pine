@@ -48,78 +48,82 @@
 indicator("VWAP Confluence [Finn]", shorttitle = "VWAPC", overlay = true, max_bars_back = 500)
 
 // -----------------------------------------------------------------------------
-// Inputs — VWAP core
+// Inputs
+//
+// Pine lists setting groups in the order they first appear here, so the three
+// groups most people actually touch are declared first and everything that can
+// be left alone is prefixed "Advanced".
 // -----------------------------------------------------------------------------
-grpVwap = "VWAP Anchor"
-anchorMode = input.string("Session", "Anchor", options = ["Session", "Week", "Month", "Quarter", "Year", "Custom date", "Rolling (N bars)"], group = grpVwap, tooltip = "Session/Week/Month/... reset the accumulation at each new period. 'Rolling (N bars)' never resets - it uses a moving window instead. On a chart whose timeframe is >= the anchor period the anchored modes degenerate (each bar is its own period); use a lower chart timeframe or a longer anchor.")
-srcPrice   = input.source(hlc3, "Price source", group = grpVwap)
-rollLen    = input.int(200, "Rolling window (bars, 'Rolling' anchor only)", minval = 2, group = grpVwap)
-customAnchorTime = input.time(timestamp("01 Jan 2024 00:00 +0000"), "Custom anchor date ('Custom date' only)", group = grpVwap)
+grpMain = "Main settings"
+anchorMode = input.string("Session", "Reset VWAP every", options = ["Session", "Week", "Month", "Quarter", "Year", "Custom date", "Rolling (N bars)"], group = grpMain, tooltip = "How far back VWAP measures. 'Session' restarts each trading day - the usual choice for day trading. Pick a longer one for swing trading, or 'Rolling' for a moving window that never restarts.\n\nNote: a 'Session' reset on a daily-or-higher chart restarts every bar and is useless. Use an intraday chart, or pick a longer reset.")
+bandBasis  = input.string("Volume-weighted sigma", "Measure distance in", options = ["Volume-weighted sigma", "ATR"], group = grpMain, tooltip = "The unit the bands are drawn in. Sigma = how far price normally strays from VWAP since the reset. ATR = average bar range. Either works; sigma hugs the day's own character more closely.\n\nThese bands are distance markers. They are NOT confidence intervals - no '95% of price stays inside' claim is made or implied.")
+srcPrice   = input.source(hlc3, "Price to average", group = grpMain, tooltip = "Which price each bar contributes. hlc3 (the default) is the standard VWAP convention.")
 
-grpBands = "Deviation Bands"
-bandBasis   = input.string("Volume-weighted sigma", "Band unit", options = ["Volume-weighted sigma", "ATR"], group = grpBands, tooltip = "Sigma = volume-weighted RMS distance of price from VWAP since the anchor. This is a descriptive spread measure, NOT a confidence interval.")
-bandMult1   = input.float(1.0, "Inner band multiple", minval = 0.1, step = 0.1, group = grpBands)
-bandMult2   = input.float(2.0, "Mid band multiple", minval = 0.1, step = 0.1, group = grpBands)
-bandMult3   = input.float(3.0, "Outer band multiple", minval = 0.1, step = 0.1, group = grpBands)
-bandWarmup  = input.int(5, "Bars after anchor before bands are considered valid", minval = 1, group = grpBands, tooltip = "Immediately after an anchor reset the dispersion is near zero, which would make the bands meaningless and the band vote spurious. Both are suppressed until this many bars have accumulated.")
+grpSig = "Buy / sell signals"
+showSignals    = input.bool(true, "Show buy/sell markers", group = grpSig, tooltip = "A marker prints when price pulls back to VWAP and then reclaims it, and only in the direction the trend engine already confirms. Turning this off hides the markers but does not change the alerts or the table.")
+signalCooldown = input.int(3, "Wait this many bars between signals", minval = 0, group = grpSig, tooltip = "Stops one long chop around VWAP from firing a cluster of near-identical markers.")
+pullbackATR    = input.float(0.0, "How close to VWAP counts as a pullback (ATRs)", minval = 0.0, step = 0.1, group = grpSig, tooltip = "0 means the bar must actually touch VWAP. Raise it to accept near-misses.")
+triggerATR     = input.float(0.0, "How far past VWAP confirms the reclaim (ATRs)", minval = 0.0, step = 0.1, group = grpSig, tooltip = "0 means any close back on the right side of VWAP confirms. Raise it to demand a more convincing close.")
+invalidATR     = input.float(1.5, "Give up on a setup once price closes this far the wrong side (ATRs)", minval = 0.1, step = 0.1, group = grpSig)
 
-grpVotes = "VWAP Votes"
-sideDeadATR       = input.float(0.05, "Side vote dead zone, in ATRs", minval = 0.0, step = 0.01, group = grpVotes, tooltip = "Price must sit at least this far from VWAP before the side vote fires, so a price oscillating on top of VWAP casts no vote.")
-vwapSlopeLookback = input.int(10, "VWAP slope lookback", minval = 1, group = grpVotes)
-vwapSlopeMinATR   = input.float(0.01, "Minimum |VWAP slope| in ATRs/bar", minval = 0.0, step = 0.005, group = grpVotes)
+grpDisp = "Chart display"
+showTable      = input.bool(true, "Show the summary table", group = grpDisp)
+tableDetail    = input.string("Simple", "Table detail", options = ["Simple", "Full"], group = grpDisp, tooltip = "'Simple' shows the plain-English read. 'Full' adds the underlying numbers. Every number is in the Data Window either way.")
+tablePos       = input.string("bottom_right", "Table position", options = ["top_right", "middle_right", "bottom_right", "top_left", "bottom_left"], group = grpDisp, tooltip = "Defaults to bottom-right so it does not collide with the Deterministic Trend Detector's table (top-right) when both are on the chart.")
+showVwap       = input.bool(true, "Show the VWAP line", group = grpDisp)
+showBands      = input.bool(true, "Show the bands", group = grpDisp)
+showBandFill   = input.bool(true, "Shade between the bands", group = grpDisp)
+showPrevVwap   = input.bool(true, "Show yesterday's closing VWAP", group = grpDisp, tooltip = "The previous period's final VWAP, carried forward as a level. Often acts as support or resistance in the next period.")
+showAnchorMark = input.bool(false, "Mark where VWAP resets", group = grpDisp)
+
+grpBands = "Advanced: band distances"
+bandMult1  = input.float(1.0, "Inner band", minval = 0.1, step = 0.1, group = grpBands)
+bandMult2  = input.float(2.0, "Middle band", minval = 0.1, step = 0.1, group = grpBands)
+bandMult3  = input.float(3.0, "Outer band", minval = 0.1, step = 0.1, group = grpBands)
+bandWarmup = input.int(5, "Bars before the bands are trusted", minval = 1, group = grpBands, tooltip = "Right after a reset there is not enough data for a meaningful spread, so the bands and the band reading stay hidden until this many bars have built up.")
+rollLen    = input.int(200, "Rolling window length (only for the 'Rolling' reset)", minval = 2, group = grpBands)
+customAnchorTime = input.time(timestamp("01 Jan 2024 00:00 +0000"), "Start date (only for the 'Custom date' reset)", group = grpBands)
+
+grpVotes = "Advanced: VWAP readings"
+sideDeadATR       = input.float(0.05, "Ignore price within this distance of VWAP (ATRs)", minval = 0.0, step = 0.01, group = grpVotes, tooltip = "Keeps the above/below reading from flickering when price sits right on top of VWAP.")
+vwapSlopeLookback = input.int(10, "Bars used to measure whether VWAP is rising or falling", minval = 1, group = grpVotes)
+vwapSlopeMinATR   = input.float(0.01, "Minimum slope to call VWAP rising or falling (ATRs/bar)", minval = 0.0, step = 0.005, group = grpVotes)
 
 // -----------------------------------------------------------------------------
-// Inputs — trend engine (identical to Deterministic_Trend_Detector.pine)
+// The trend engine below is identical to Deterministic_Trend_Detector.pine, so
+// these settings mean exactly what they mean there. Leave them alone unless you
+// have already tuned that indicator and want this one to match.
 // -----------------------------------------------------------------------------
-grpReg = "Trend: Regression (slope + linearity)"
+grpReg = "Advanced trend engine: regression"
 regLen      = input.int(34, "Regression length", minval = 5, group = grpReg)
-atrLen      = input.int(14, "ATR length (normalization)", minval = 1, group = grpReg)
+atrLen      = input.int(14, "ATR length (used for normalization everywhere)", minval = 1, group = grpReg)
 rSquaredMin = input.float(0.35, "Minimum R^2 to trust slope direction", minval = 0.0, maxval = 1.0, step = 0.05, group = grpReg)
 slopeMinATR = input.float(0.03, "Minimum |slope| in ATRs/bar", minval = 0.0, step = 0.01, group = grpReg)
 
-grpDmi = "Trend: Directional Movement (Wilder)"
+grpDmi = "Advanced trend engine: directional movement (Wilder)"
 diLen        = input.int(14, "DI length", minval = 1, group = grpDmi)
 adxSmooth    = input.int(14, "ADX smoothing", minval = 1, group = grpDmi)
 adxThreshold = input.float(20.0, "ADX trend threshold", minval = 0, group = grpDmi)
 
-grpChop = "Trend: Choppiness Index"
+grpChop = "Advanced trend engine: choppiness index"
 chopLen         = input.int(14, "Choppiness length", minval = 2, group = grpChop)
 chopSidewaysMin = input.float(61.8, "Choppiness >= this => sideways", group = grpChop)
 chopOverride    = input.bool(true, "Let Choppiness force the 'Sideways' label", group = grpChop)
 
-grpStruct = "Trend: Swing Structure (Dow Theory)"
+grpStruct = "Advanced trend engine: swing structure (Dow Theory)"
 pivotLeft  = input.int(5, "Pivot left bars", minval = 1, group = grpStruct)
 pivotRight = input.int(5, "Pivot right bars", minval = 1, group = grpStruct)
 
-grpMa = "Trend: Moving Average Geometry"
+grpMa = "Advanced trend engine: moving averages"
 maType        = input.string("EMA", "MA type", options = ["EMA", "SMA", "WMA", "HMA", "RMA"], group = grpMa)
 fastLen       = input.int(21, "Fast MA length", minval = 1, group = grpMa)
 midLen        = input.int(55, "Mid MA length", minval = 1, group = grpMa)
 slowLen       = input.int(200, "Slow MA length", minval = 1, group = grpMa)
 slopeLookback = input.int(10, "Slow MA slope lookback", minval = 1, group = grpMa)
 
-grpScore = "Trend: Composite Classification"
+grpScore = "Advanced trend engine: scoring"
 strongThresh = input.int(4, "Score >= this => Strong trend", minval = 1, maxval = 5, group = grpScore)
 weakThresh   = input.int(2, "Score >= this => Trend", minval = 1, maxval = 5, group = grpScore)
-
-// -----------------------------------------------------------------------------
-// Inputs — value-entry signals
-// -----------------------------------------------------------------------------
-grpSig = "Value Entry Signals"
-showSignals   = input.bool(true, "Show value-entry signals", group = grpSig)
-pullbackATR   = input.float(0.0, "Arm when price trades within this many ATRs of VWAP", minval = 0.0, step = 0.1, group = grpSig, tooltip = "0 means the bar's low must actually reach VWAP (or the high must reach it, for shorts).")
-triggerATR    = input.float(0.0, "Fire when close reclaims VWAP by this many ATRs", minval = 0.0, step = 0.1, group = grpSig)
-invalidATR    = input.float(1.5, "Cancel a setup once close is this many ATRs the wrong side of VWAP", minval = 0.1, step = 0.1, group = grpSig)
-signalCooldown = input.int(3, "Minimum bars between signals", minval = 0, group = grpSig)
-
-grpDisp = "Display"
-showVwap      = input.bool(true, "Plot VWAP", group = grpDisp)
-showBands     = input.bool(true, "Plot deviation bands", group = grpDisp)
-showBandFill  = input.bool(true, "Shade band zones", group = grpDisp)
-showPrevVwap  = input.bool(true, "Plot previous period's closing VWAP", group = grpDisp)
-showAnchorMark = input.bool(false, "Mark anchor resets", group = grpDisp)
-showTable     = input.bool(true, "Show breakdown table", group = grpDisp)
-tablePos      = input.string("bottom_right", "Table position", options = ["top_right", "middle_right", "bottom_right", "top_left", "bottom_left"], group = grpDisp, tooltip = "Defaults to bottom-right so it does not collide with the Deterministic Trend Detector's own table (top-right) when both are on the chart.")
 
 // =============================================================================
 // SECTION A — VWAP, deviation bands, and VWAP votes
@@ -495,7 +499,11 @@ plot(combinedScore, "Combined score", display = display.data_window)
 plot(anchorBars, "Bars since anchor", display = display.data_window)
 
 // -----------------------------------------------------------------------------
-// Breakdown table
+// Summary table
+//
+// Everything here is a plain-English rendering of values already computed
+// above - no logic lives in this section. The raw numbers behind every row
+// stay available in the Data Window regardless of the detail setting.
 // -----------------------------------------------------------------------------
 f_tablePos(p) =>
     switch p
@@ -506,38 +514,93 @@ f_tablePos(p) =>
         "bottom_left"  => position.bottom_left
         => position.bottom_right
 
-var table infoTable = table.new(f_tablePos(tablePos), 2, 15, border_width = 1)
+var table infoTable = table.new(f_tablePos(tablePos), 2, 13, border_width = 1)
 
 f_cell(t, row, label, value, valColor) =>
-    table.cell(t, 0, row, label, text_color = color.white, bgcolor = color.new(color.black, 30), text_size = size.small)
-    table.cell(t, 1, row, value, text_color = valColor, bgcolor = color.new(color.black, 30), text_size = size.small)
+    table.cell(t, 0, row, label, text_color = color.new(color.silver, 0), bgcolor = color.new(color.black, 20), text_size = size.small, text_halign = text.align_left)
+    table.cell(t, 1, row, value, text_color = valColor, bgcolor = color.new(color.black, 20), text_size = size.small, text_halign = text.align_left)
 
-f_voteText(v) =>
-    v == 1 ? "+1 bullish" : (v == -1 ? "-1 bearish" : "0 neutral")
+// The one row a glance should land on, so it gets its own weight and colour.
+f_headline(t, row, label, value, valColor, bg) =>
+    table.cell(t, 0, row, label, text_color = color.new(color.white, 0), bgcolor = bg, text_size = size.normal, text_halign = text.align_left)
+    table.cell(t, 1, row, value, text_color = valColor, bgcolor = bg, text_size = size.normal, text_halign = text.align_left)
 
+// -----------------------------------------------------------------------------
+// Plain-English renderings of the numeric state
+// -----------------------------------------------------------------------------
 f_voteColor(v) =>
     v == 1 ? color.lime : (v == -1 ? color.red : color.silver)
 
-if showTable and barstate.islast
-    alignColor = alignedLong ? color.lime : (alignedShort ? color.red : (conflicted ? color.orange : color.silver))
-    trendColor = trendUp ? color.lime : (trendDown ? color.red : color.silver)
+f_trendWords(st) =>
+    switch st
+        "Strong Uptrend"   => "Up (strong)"
+        "Uptrend"          => "Up"
+        "Strong Downtrend" => "Down (strong)"
+        "Downtrend"        => "Down"
+        => "Sideways - no trend"
 
-    f_cell(infoTable, 0, "Alignment", alignment, alignColor)
-    f_cell(infoTable, 1, "Setup", setupState, (longArmed or shortArmed or longSignal or shortSignal) ? color.yellow : color.silver)
-    f_cell(infoTable, 2, "Combined score", str.tostring(combinedScore) + " / 8", color.white)
-    f_cell(infoTable, 3, "Trend state", trendState + " (" + str.tostring(rawScore) + "/5)", trendColor)
-    f_cell(infoTable, 4, "VWAP state", vwapState, color.white)
-    f_cell(infoTable, 5, "VWAP score", str.tostring(vwapScore) + " / 3", color.white)
-    f_cell(infoTable, 6, "  Side vote", f_voteText(voteVwapSide), f_voteColor(voteVwapSide))
-    f_cell(infoTable, 7, "  Slope vote", f_voteText(voteVwapSlope), f_voteColor(voteVwapSlope))
-    f_cell(infoTable, 8, "  Band vote", f_voteText(voteVwapBand), f_voteColor(voteVwapBand))
-    f_cell(infoTable, 9, "Anchor", anchorMode + (useRolling ? " (" + str.tostring(rollLen) + ")" : ""), color.white)
-    f_cell(infoTable, 10, "Bars since anchor", useRolling ? "n/a" : str.tostring(anchorBars), color.white)
-    f_cell(infoTable, 11, "VWAP", na(vwapVal) ? "n/a" : str.tostring(vwapVal, format.mintick), color.white)
-    f_cell(infoTable, 12, "Band unit (" + (bandBasis == "ATR" ? "ATR" : "sigma") + ")", na(bandUnit) ? "n/a" : str.tostring(bandUnit, format.mintick), color.white)
-    f_cell(infoTable, 13, "Z-position", bandsValid ? str.tostring(zPos, "#.##") : "warming up", color.white)
+// What the whole script is telling you to do.
+bottomLine = alignedLong ? "Look for BUYS" :
+     alignedShort ? "Look for SELLS" :
+     conflicted ? "Stand aside - signals disagree" :
+     "No clear edge right now"
+
+// What is happening this bar, and what it is waiting for next.
+rightNow = longSignal ? "BUY - bounced off VWAP" :
+     shortSignal ? "SELL - rejected at VWAP" :
+     longArmed ? "At VWAP - waiting for it to hold" :
+     shortArmed ? "At VWAP - waiting for it to fail" :
+     alignedLong ? "Waiting for a pullback down to VWAP" :
+     alignedShort ? "Waiting for a bounce up to VWAP" :
+     "Nothing to do"
+
+priceVsVwap = voteVwapSide == 1 ? "Above fair value" :
+     voteVwapSide == -1 ? "Below fair value" :
+     "Right at fair value"
+
+fairValueDir = voteVwapSlope == 1 ? "Rising" :
+     voteVwapSlope == -1 ? "Falling" :
+     "Flat"
+
+positionWords = not bandsValid ? "Still building" :
+     zPos > bandMult3 ? "Very stretched above" :
+     zPos > bandMult1 ? "Extended above" :
+     zPos >= -bandMult1 ? "Near fair value" :
+     zPos >= -bandMult3 ? "Extended below" :
+     "Very stretched below"
+
+agreement = combinedScore > 0 ? str.tostring(combinedScore) + " of 8 point up" :
+     combinedScore < 0 ? str.tostring(-combinedScore) + " of 8 point down" :
+     "Evenly split"
+
+distanceWords = not bandsValid ? "still building" :
+     str.tostring(math.abs(zPos), "#.#") + " bands " + (zPos >= 0 ? "above" : "below")
+
+if showTable and barstate.islast
+    headlineBg = alignedLong ? color.new(color.green, 25) :
+         alignedShort ? color.new(color.red, 25) :
+         conflicted ? color.new(color.orange, 35) :
+         color.new(color.gray, 40)
+    trendColor = trendUp ? color.lime : (trendDown ? color.red : color.silver)
+    actionColor = (longSignal or shortSignal) ? color.yellow : color.new(color.white, 0)
+
+    f_headline(infoTable, 0, "Bottom line", bottomLine, color.new(color.white, 0), headlineBg)
+    f_cell(infoTable, 1, "Right now", rightNow, actionColor)
+    f_cell(infoTable, 2, "Trend", f_trendWords(trendState), trendColor)
+    f_cell(infoTable, 3, "Price vs VWAP", priceVsVwap, f_voteColor(voteVwapSide))
+    f_cell(infoTable, 4, "Fair value is", fairValueDir, f_voteColor(voteVwapSlope))
+    f_cell(infoTable, 5, "Position", positionWords, color.new(color.white, 0))
+    f_cell(infoTable, 6, "Agreement", agreement, color.new(color.white, 0))
+
+    if tableDetail == "Full"
+        f_cell(infoTable, 7, "VWAP now", na(vwapVal) ? "n/a" : str.tostring(vwapVal, format.mintick), color.new(color.white, 0))
+        f_cell(infoTable, 8, "Distance from VWAP", distanceWords, color.new(color.white, 0))
+        f_cell(infoTable, 9, "Trend score", str.tostring(rawScore) + " of 5", color.new(color.white, 0))
+        f_cell(infoTable, 10, "VWAP score", str.tostring(vwapScore) + " of 3", color.new(color.white, 0))
+        f_cell(infoTable, 11, "Resets", anchorMode + (useRolling ? " (" + str.tostring(rollLen) + " bars)" : " - " + str.tostring(anchorBars) + " bars in"), color.new(color.white, 0))
+
     if volumeMissing
-        f_cell(infoTable, 14, "WARNING", "No volume on this symbol - VWAP is undefined", color.orange)
+        f_cell(infoTable, 12, "PROBLEM", "This symbol has no volume - VWAP cannot be calculated", color.orange)
 
 // -----------------------------------------------------------------------------
 // Alerts

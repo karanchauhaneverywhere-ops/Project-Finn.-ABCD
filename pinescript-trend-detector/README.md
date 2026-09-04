@@ -68,115 +68,131 @@ so the classifier can be tuned per instrument and timeframe.
 
 ## Using the VWAP indicator
 
-`indicators/VWAP_Confluence.pine` adds the axis the five trend components
-don't cover. All five answer *which way is price going?*; none answer *is
-this a good price to act at?* A trend follower that enters the instant its
-score crosses a threshold buys wherever price happens to be — often well
-extended from any reference value, which is where give-back comes from.
+### In plain English
 
-VWAP is the volume-weighted average transaction price since an anchor: a
-**location** reference, not a direction forecast. This script pairs the two —
-direction from the trend score, location from VWAP — and it re-runs the
-identical five-component engine in-file, so the trend label it reports is
-the same one the detector shows on the same bar.
+VWAP is the average price everyone actually traded at today, weighted by how
+much traded at each price. Think of it as **today's fair price**.
 
-Add it the same way (Pine Editor → paste → **Add to chart**). It is designed
-to sit on the chart *alongside* the detector: its table defaults to the
-bottom-right so it doesn't collide with the detector's top-right one, and it
-plots in a blue family that doesn't clash with the detector's MA colors.
+Your trend detector already tells you *which way the market is going*. It does
+not tell you *whether right now is a good price to get in at*. So it can put
+you into a good uptrend at a bad price — right after a big run, just before a
+pullback. That gap is where a lot of give-back comes from.
 
-### What it puts on the chart
+This indicator fills it. Simple version:
 
-- **VWAP**, colored by alignment (green aligned-long, red aligned-short,
-  blue otherwise), with three deviation bands and shaded zones.
-- **The previous period's closing VWAP** as a stepped line — a level that
-  frequently acts as support/resistance in the next period.
-- **Value-entry markers** (`VWAP+` / `VWAP-`): a pullback to VWAP that was
-  then reclaimed, taken *only* in the direction the trend engine already
-  confirms.
-- **A breakdown table** showing the alignment verdict, current setup state,
-  the combined score, both underlying scores, each VWAP vote, and the
-  anchor's status.
+> **Trade in the direction your trend detector confirms — but wait to get in
+> until price comes back to fair value.**
 
-### The three VWAP votes
+That is the whole idea. Everything else in the script is bookkeeping for it.
 
-Each casts `+1` / `0` / `-1` on the same convention the trend engine uses,
-summing to a VWAP score in `[-3, +3]`:
+### The one row that matters
 
-1. **Side** — is price accepted above or below VWAP, beyond an ATR dead zone
-   (so price sitting on top of VWAP casts no vote rather than flickering).
-2. **Slope** — which way fair value itself is moving. Price above a *falling*
-   VWAP is a different condition from price above a *rising* one.
-3. **Band zone** — at value (inside the inner band) casts 0; participation
-   between the inner and outer bands casts a directional vote; beyond the
-   outer band casts 0 for *extended*, deliberately not a counter-trend vote
-   (see below).
+Add the script (Pine Editor → paste → **Add to chart**) and you get a small
+table. The top row is the answer:
 
-Because both scores are in the same vote units, they sum directly into a
-`combinedScore` in `[-8, +8]`, available in the Data Window.
-
-### Alignment, and how to trade it
-
-The table's top row is the point of the script:
-
-| Verdict | Meaning |
+| Bottom line | What it means |
 | --- | --- |
-| **Aligned LONG** | Trend engine says up *and* VWAP location agrees |
-| **Aligned SHORT** | Trend engine says down *and* VWAP location agrees |
-| **Conflicted** | The two disagree — e.g. a confirmed uptrend while price sits below a falling VWAP |
-| **Neutral** | No confirmed trend, or VWAP casts no net vote |
+| **Look for BUYS** | Trend is up *and* price/VWAP agree. Buy the next pullback to VWAP. |
+| **Look for SELLS** | Trend is down *and* price/VWAP agree. Sell the next bounce to VWAP. |
+| **Stand aside - signals disagree** | Trend says one thing, VWAP says the other. Usually worth skipping. |
+| **No clear edge right now** | No confirmed trend. Nothing to do. |
 
-Two practical ways to use it with the existing strategy:
+The second row, "Right now", tells you what it's waiting for — *"Waiting for a
+pullback down to VWAP"*, *"At VWAP - waiting for it to hold"*, or
+*"BUY - bounced off VWAP"* when a signal actually fires. Between those two
+rows you can read the whole state without knowing any of the math.
 
-- **As a location filter.** Take the strategy's entries only when alignment
-  agrees. "Conflicted" is the specific state worth respecting: the trend
-  label is still up, but participants are transacting below a declining
-  fair value.
-- **As an entry trigger.** Use the `VWAP+` / `VWAP-` markers instead of the
-  raw score cross. Same direction, better price — the pullback is bought at
-  value rather than at whatever price the score happened to cross at.
+The rest of the table is supporting detail in the same plain language:
 
-### Key inputs
+- **Trend** — Up / Up (strong) / Sideways / Down / Down (strong)
+- **Price vs VWAP** — above, below, or right at fair value
+- **Fair value is** — rising, falling, or flat (price above a *falling* VWAP is
+  a very different situation from price above a rising one)
+- **Position** — near fair value, extended, or very stretched
+- **Agreement** — how many of the 8 underlying checks point the same way
 
-- **Anchor** — Session / Week / Month / Quarter / Year / Custom date /
-  Rolling (N bars). Session is the intraday default. Note that an anchored
-  mode degenerates on a chart at or above the anchor's own timeframe (a
-  "Session" anchor on a daily chart resets every bar); use a lower chart
-  timeframe or a longer anchor.
-- **Band unit** — volume-weighted sigma (default) or ATR. See the caveat
-  below on what sigma does and doesn't mean here.
-- **Value entry distances** (`pullbackATR`, `triggerATR`, `invalidATR`) — all
-  expressed in ATRs rather than band units, so a pinched band right after an
-  anchor reset can't distort the setup logic. Defaults require the bar's low
-  to actually reach VWAP and the close to finish back above it.
-- **Minimum bars between signals** — a cooldown (default 3) so one extended
-  consolidation around VWAP doesn't emit a cluster of near-identical
-  signals.
+Set **Table detail** to *Full* in the settings if you want the raw numbers
+(VWAP price, distance, the two scores) added underneath. They are always in
+the Data Window either way.
 
-### Two deliberate design choices worth knowing
+### The markers
 
-- **The bands are not confidence intervals.** Sigma here is the
-  volume-weighted RMS distance of price from its own weighted mean — a
-  descriptive spread measure computed exactly from the bars in the window.
-  The familiar "2σ ≈ 95%" reading requires assuming normally distributed
-  returns, which this toolkit explicitly rejects. The bands are distance
-  markers in a volatility-scaled unit, nothing more.
-- **An outer-band tag votes 0, not counter-trend.** Treating "far from the
-  mean" as a reversal signal is exactly a probability claim — that price
-  reverts often enough for the bet to pay. Extension is reported as an
-  *absence* of a directional read, which is what the geometry supports.
+`VWAP+` under a bar means: the trend was confirmed up, price pulled back and
+touched VWAP, and this bar closed back above it. `VWAP-` is the mirror image.
+Those are the entries — same direction your strategy would have taken, but
+bought at fair value instead of wherever the score happened to cross.
+
+### Settings
+
+Only three groups matter to start:
+
+- **Main settings** — how often VWAP resets (Session = each trading day, the
+  usual choice for day trading; pick a longer one for swing trading).
+- **Buy / sell signals** — how strict the pullback and reclaim have to be.
+- **Chart display** — what to show, and how much table detail.
+
+Everything prefixed **Advanced** can be left alone. The "Advanced trend
+engine" groups are the same settings as `Deterministic_Trend_Detector.pine`
+and mean exactly what they mean there — only change them if you've already
+tuned that indicator and want this one to match.
+
+### How it fits your existing strategy
+
+Two ways to use it:
+
+- **As a filter.** Take your strategy's entries only when the bottom line
+  agrees. "Stand aside" is the state worth respecting: the trend label is
+  still up, but people are trading *below* a falling fair value.
+- **As the entry trigger.** Use the `VWAP+` / `VWAP-` markers instead of the
+  raw score cross. Same direction, better price.
+
+### Under the hood
+
+The script re-runs your identical five-component trend engine in-file, so the
+trend it reports matches the detector bar-for-bar. (It duplicates the engine
+for the same reason the strategy does: TradingView scripts can't share code
+without publishing a separate Pine library.)
+
+On top of that it adds three readings of its own, each casting the same
+`+1` / `0` / `-1` vote the trend components use:
+
+1. **Side** — is price above or below VWAP, beyond a small dead zone so price
+   sitting right on VWAP doesn't flicker between readings.
+2. **Slope** — is fair value itself rising or falling.
+3. **Position** — at value, participating away from value, or extended.
+
+Those sum to a VWAP score in `[-3, +3]`, which adds to the trend score for the
+"Agreement" row's `[-8, +8]`. On the chart you also get the VWAP line coloured
+by the bottom line, three bands either side, and the previous period's closing
+VWAP as a stepped line — a level that often acts as support or resistance in
+the next period.
+
+Full math and the reasoning behind each choice is in
+[`METHODOLOGY.md`](./METHODOLOGY.md).
+
+### Two things it deliberately does not claim
+
+- **The bands are not confidence intervals.** Sigma here is just how far price
+  normally strays from VWAP since the reset, measured from the bars in front
+  of you. The familiar "2 sigma ≈ 95% of the time" reading needs price moves
+  to follow a normal distribution, which they demonstrably don't — that's why
+  this toolkit avoids probability claims in the first place. Treat the bands
+  as distance markers, nothing more.
+- **Hitting the outer band is not a reversal signal.** The script reports it
+  as "very stretched" and casts no directional vote. Calling it a reversal
+  would be a bet that price snaps back often enough to pay, which is exactly
+  the kind of claim this toolkit doesn't make.
 
 ### What it costs you
 
-If a trend never returns to VWAP, this fires no signal and the move is
-missed entirely. That is the price of insisting on location, and it is the
-main thing to check before wiring the markers into an entry rule: compare
-how often your instrument pulls back to value against how often it just
-runs.
+If a trend never pulls back to VWAP, no marker fires and you miss the move
+entirely. That's the real price of insisting on a good entry, and it's the
+main thing to check before wiring the markers into a rule: see how often your
+instrument actually returns to value versus how often it just runs.
 
-Requires a symbol with a volume feed — a volume-weighted mean is *undefined*,
-not merely noisy, without one. The script detects this and says so in its
-table instead of plotting a misleading line.
+It also needs a symbol with volume data. Without it a volume-weighted average
+is *undefined*, not merely noisy — the table says so outright rather than
+drawing a misleading line.
 
 ## Using the strategy
 
