@@ -1,7 +1,7 @@
 //@version=6
 
 // =============================================================================
-// Deterministic Trend Strategy
+// Deterministic Trend Strategy (v2 — whipsaw-reduction pass)
 // -----------------------------------------------------------------------------
 // Trades the same deterministic trend classification used by
 // ../indicators/Deterministic_Trend_Detector.pine (duplicated here because
@@ -9,11 +9,31 @@
 // script file, and importing a Pine *library* requires it to be published
 // separately on TradingView first).
 //
-// Entries/exits fire only on a trend-state transition. Risk is managed with
-// a fixed ATR-multiple protective stop and fixed-fractional equity sizing
-// (strategy()'s default_qty_type = percent_of_equity below) — a deterministic
-// capital-allocation rule, not a probability-of-win-based sizing scheme such
-// as the Kelly criterion. See ../METHODOLOGY.md for the full rationale.
+// v2 changes, aimed at the whipsaw/give-back costs that commonly produce
+// negative P&L in a naive trend-follower, all still closed-form/deterministic:
+//
+//   1. Entry/exit hysteresis: entries require the score to reach `weakThresh`,
+//      but an open position is only closed once the score falls back to
+//      `exitThresh` (a wider, separately-tunable dead zone) — not the instant
+//      it drops one point below the entry bar. This removes the single-bar
+//      "flip and flip back" whipsaw the v1 threshold shared for both.
+//   2. The Choppiness Index now only *blocks new entries*; it no longer force-
+//      closes an existing position. In v1, a transient chop spike during a
+//      pullback inside a strong trend would flatten the position outright.
+//   3. A chandelier-style ATR trailing stop replaces the static stop. It only
+//      ratchets in the trade's favor (never loosens), so it both bounds
+//      initial risk and locks in open profit instead of relying solely on
+//      the lagging score-flip exit.
+//   4. An optional higher-timeframe trend filter (off by default) can require
+//      price to be above/below a higher-timeframe EMA before allowing longs/
+//      shorts respectively — useful if a Strategy Tester breakdown shows one
+//      side (typically shorts, in a persistently trending instrument) is the
+//      P&L drag.
+//
+// Risk sizing itself (fixed-fractional % of equity per trade) is unchanged
+// from v1 — a deterministic capital-allocation rule, not a probability-of-
+// win-based scheme such as the Kelly criterion. See ../METHODOLOGY.md for
+// the full rationale behind the "no probability assumptions" design.
 //
 // This script is for research/education. It is not financial advice.
 // Backtest results do not guarantee future performance.
@@ -59,10 +79,15 @@ strongThresh = input.int(4, "Score >= this => Strong trend", minval = 1, maxval 
 weakThresh   = input.int(2, "Score >= this => Trend", minval = 1, maxval = 5, group = grpScore)
 
 grpTrade = "Trading Rules"
-allowLong      = input.bool(true, "Allow long entries", group = grpTrade)
-allowShort     = input.bool(true, "Allow short entries", group = grpTrade)
-exitOnSideways = input.bool(true, "Flatten when state becomes Sideways/Range", group = grpTrade)
-atrStopMult    = input.float(2.5, "Protective stop, in ATRs", minval = 0.5, step = 0.5, group = grpTrade)
+allowLong   = input.bool(true, "Allow long entries", group = grpTrade)
+allowShort  = input.bool(true, "Allow short entries", group = grpTrade)
+exitThresh  = input.int(0, "Exit when score crosses this (must be < weakThresh — the gap is the hysteresis dead zone)", minval = -4, maxval = 4, group = grpTrade)
+atrStopMult = input.float(2.5, "Initial risk & chandelier trail, in ATRs", minval = 0.5, step = 0.5, group = grpTrade)
+
+grpHtf = "Higher-Timeframe Filter (optional, off by default)"
+useHtfFilter = input.bool(false, "Require higher-timeframe trend alignment", group = grpHtf)
+htfRes       = input.timeframe("D", "Higher timeframe", group = grpHtf)
+htfMaLen     = input.int(50, "Higher-timeframe EMA length", minval = 1, group = grpHtf)
 
 grpDisp = "Display"
 showBg = input.bool(true, "Shade background by trend", group = grpDisp)
@@ -158,7 +183,7 @@ maSlope     = slowMA - slowMA[slopeLookback]
 voteMASlope = int(math.sign(maSlope))
 
 // -----------------------------------------------------------------------------
-// Composite score & classification
+// Composite score & classification (unchanged engine; still drives display)
 // -----------------------------------------------------------------------------
 rawScore = voteRegression + voteADX + voteStructure + voteStack + voteMASlope
 
@@ -176,19 +201,33 @@ else if rawScore <= -weakThresh
 else
     trendState := "Sideways / Range"
 
-trendChanged = trendState != trendState[1]
-isUptrend    = trendState == "Uptrend" or trendState == "Strong Uptrend"
-isDowntrend  = trendState == "Downtrend" or trendState == "Strong Downtrend"
-isSideways   = trendState == "Sideways / Range"
+// -----------------------------------------------------------------------------
+// Optional higher-timeframe trend filter (v2, fix #4 infrastructure)
+// lookahead_off avoids using an HTF bar that hasn't closed yet on this chart.
+// -----------------------------------------------------------------------------
+htfMA = request.security(syminfo.tickerid, htfRes, ta.ema(close, htfMaLen), lookahead = barmerge.lookahead_off)
+htfAllowsLong  = not useHtfFilter or close > htfMA
+htfAllowsShort = not useHtfFilter or close < htfMA
 
 // -----------------------------------------------------------------------------
-// Trading rules
+// Trading rules (v2: hysteresis + chop-as-entry-filter, not exit-forcer)
 // -----------------------------------------------------------------------------
-longCondition  = allowLong and trendChanged and isUptrend
-shortCondition = allowShort and trendChanged and isDowntrend
+chopBlocksEntry = chopOverride and chopSideways
 
-exitLongCondition  = strategy.position_size > 0 and (isDowntrend or (exitOnSideways and isSideways))
-exitShortCondition = strategy.position_size < 0 and (isUptrend or (exitOnSideways and isSideways))
+longQualifies  = allowLong  and htfAllowsLong  and not chopBlocksEntry and rawScore >= weakThresh
+shortQualifies = allowShort and htfAllowsShort and not chopBlocksEntry and rawScore <= -weakThresh
+
+// Rising edge: fires on a fresh score cross into qualifying territory, or on
+// chop clearing while the score already qualifies — either way, only once.
+longCondition  = longQualifies  and not longQualifies[1]
+shortCondition = shortQualifies and not shortQualifies[1]
+
+// Exit uses its own (looser) threshold, independent of Choppiness, so a
+// position survives the same transient noise that would have blocked a
+// fresh entry. exitThresh should be set below weakThresh to create a dead
+// zone between "would enter" and "gives up" — that gap is the hysteresis.
+exitLongCondition  = strategy.position_size > 0 and rawScore <= exitThresh
+exitShortCondition = strategy.position_size < 0 and rawScore >= -exitThresh
 
 if longCondition
     strategy.entry("Long", strategy.long)
@@ -196,17 +235,35 @@ if shortCondition
     strategy.entry("Short", strategy.short)
 
 if exitLongCondition
-    strategy.close("Long", comment = "Trend flip")
+    strategy.close("Long", comment = "Score exit")
 if exitShortCondition
-    strategy.close("Short", comment = "Trend flip")
+    strategy.close("Short", comment = "Score exit")
 
-longStopPrice  = strategy.position_avg_price - atrStopMult * atrVal
-shortStopPrice = strategy.position_avg_price + atrStopMult * atrVal
+// -----------------------------------------------------------------------------
+// Chandelier-style ATR trailing stop (v2, fix #3): seeded at entry, then only
+// ever ratchets in the trade's favor — bounds initial risk AND locks in open
+// profit, instead of relying solely on the lagging score-flip exit above.
+// -----------------------------------------------------------------------------
+longJustEntered  = strategy.position_size > 0 and strategy.position_size[1] <= 0
+shortJustEntered = strategy.position_size < 0 and strategy.position_size[1] >= 0
+
+var float longStopLevel  = na
+var float shortStopLevel = na
+
+if longJustEntered
+    longStopLevel := high - atrStopMult * atrVal
+else if strategy.position_size > 0
+    longStopLevel := math.max(longStopLevel, high - atrStopMult * atrVal)
+
+if shortJustEntered
+    shortStopLevel := low + atrStopMult * atrVal
+else if strategy.position_size < 0
+    shortStopLevel := math.min(shortStopLevel, low + atrStopMult * atrVal)
 
 if strategy.position_size > 0
-    strategy.exit("Long stop", "Long", stop = longStopPrice)
+    strategy.exit("Long stop", "Long", stop = longStopLevel)
 if strategy.position_size < 0
-    strategy.exit("Short stop", "Short", stop = shortStopPrice)
+    strategy.exit("Short stop", "Short", stop = shortStopLevel)
 
 // -----------------------------------------------------------------------------
 // Visuals
@@ -226,3 +283,5 @@ bgcolor(showBg ? bgColor : na)
 plot(rawScore, "Composite score", display = display.data_window)
 plot(adxValue, "ADX", display = display.data_window)
 plot(chop, "Choppiness", display = display.data_window)
+plot(strategy.position_size > 0 ? longStopLevel : na, "Long chandelier stop", color = color.new(color.red, 0), style = plot.style_linebr)
+plot(strategy.position_size < 0 ? shortStopLevel : na, "Short chandelier stop", color = color.new(color.red, 0), style = plot.style_linebr)

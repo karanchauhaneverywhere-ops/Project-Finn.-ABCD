@@ -69,19 +69,36 @@ so the classifier can be tuned per instrument and timeframe.
 `strategies/Deterministic_Trend_Strategy.pine` reuses the identical
 five-component engine (duplicated in-file, since Pine strategies and
 indicators can't share code without publishing a separate Pine *library* on
-TradingView) and wires it to orders:
+TradingView) and wires it to orders. As of **v2**, the order-management layer
+was reworked specifically to reduce whipsaw/give-back costs:
 
-- Enters long on a transition into Uptrend/Strong Uptrend, short on a
-  transition into Downtrend/Strong Downtrend (either side can be disabled
-  via input).
-- Optionally flattens when the state becomes Sideways/Range.
-- Uses a fixed ATR-multiple protective stop and fixed-fractional
-  percent-of-equity position sizing — a deterministic capital-allocation
-  rule, not a win-probability-based scheme like the Kelly criterion.
+- **Entry/exit hysteresis.** Entries require the score to reach `weakThresh`;
+  an open position only closes once the score falls back to the separate,
+  looser `exitThresh` (default 0). v1 used the same threshold for both,
+  so a single point of noise could flip a position open and shut on
+  consecutive bars.
+- **Choppiness Index is now an entry filter, not an exit trigger.** A chop
+  spike blocks *new* entries but no longer force-closes an existing
+  position — v1 would flatten a strong trend on a transient chop reading
+  during a normal pullback.
+- **Chandelier-style ATR trailing stop.** The stop is seeded at entry and
+  only ever ratchets in the trade's favor (never loosens), so it bounds
+  initial risk *and* locks in open profit, instead of relying solely on
+  the lagging score-flip exit.
+- **Optional higher-timeframe filter** (`Higher-Timeframe Filter` group,
+  off by default): requires price to be above/below a higher-timeframe EMA
+  before allowing longs/shorts respectively. Turn this on if the Strategy
+  Tester's long/short breakdown shows one side is the P&L drag (e.g.
+  countertrend shorts losing money against a persistent higher-timeframe
+  uptrend).
+- Uses fixed-fractional percent-of-equity position sizing — a deterministic
+  capital-allocation rule, not a win-probability-based scheme like the
+  Kelly criterion.
 
 Add it to a chart the same way (paste into Pine Editor → Add to chart), then
-use TradingView's **Strategy Tester** tab to review backtested performance,
-and tune commission/slippage inputs at the top of the script to match your
+use TradingView's **Strategy Tester** tab — check the **Performance
+Summary**'s Long/Short breakdown specifically before tuning further — and
+adjust commission/slippage inputs at the top of the script to match your
 broker before drawing any conclusions from the results.
 
 ## Limitations, honestly stated
