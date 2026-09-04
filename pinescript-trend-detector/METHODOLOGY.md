@@ -5,6 +5,23 @@ Uptrend / Sideways-Range / Downtrend / Strong Downtrend) is computed, and why
 every step is a **closed-form deterministic calculation** rather than a
 probability model.
 
+> ## Two engines currently live here
+>
+> | Script | Engine | Documented in |
+> |--------|--------|---------------|
+> | `indicators/Path_Geometry_Trend_Detector.pine` | Path geometry (4 components) | [Part B](#part-b--the-path-geometry-engine-indicator) |
+> | `strategies/Deterministic_Trend_Strategy.pine` | Five-vote (regression/ADX/chop/pivots/MAs) | Part A, below |
+>
+> **They do not currently measure the same thing.** The indicator was
+> rewritten onto a new engine; the strategy has not been ported yet. Until it
+> is, do not treat the indicator's markers as a preview of the strategy's
+> trades — that mismatch is exactly what produced losing discretionary trades
+> before.
+
+---
+
+# Part A — the five-vote engine (strategy)
+
 ## Design principle: no probability assumptions
 
 "No probability assumptions" is a specific, checkable constraint. It rules
@@ -221,3 +238,147 @@ whether the bar has closed. Neither introduces an estimated likelihood.
   of price geometry, not a prediction. Backtested results in
   `strategies/Deterministic_Trend_Strategy.pine` are shown for research only
   and do not indicate future returns.
+
+---
+
+# Part B — the path geometry engine (indicator)
+
+The five-vote engine in Part A measures a trend by **fitting and smoothing**:
+a least-squares line through price, Wilder-smoothed directional movement, and
+three moving averages. Everything it knows about price it learns through an
+average of some kind.
+
+The path geometry engine starts from a different premise: **a trend is a path
+that covers ground efficiently in one direction; a range is a path that
+travels just as far and arrives nowhere.** That distinction is measurable
+directly from the path, with no line fit and no smoothing.
+
+Four components, each normalized to `[-1, +1]`.
+
+## B1. Signed Efficiency Ratio
+
+```
+netMove = close - close[erLen]
+pathLen = Σ |close - close[1]| over erLen bars
+ER      = netMove / pathLen
+```
+
+Walk `erLen` bars, adding up every step taken — that is the path length. Then
+measure how far you actually ended up from where you started. The ratio of the
+two is the efficiency of the journey.
+
+- A straight line up: displacement equals path length → **+1**
+- A straight line down → **−1**
+- Thrashing that returns to its origin: displacement 0 → **0**
+
+One number carrying both direction and straightness. It is the closest thing
+here to a single-line definition of "trend", and unlike the regression slope
+of Part A it needs no fitted line, no least squares, and no separate
+goodness-of-fit measure to interpret it — a low `|ER|` *is* the statement that
+price is not travelling in a line.
+
+## B2. Breakout structure
+
+```
+upperBand = highest(high, donLen)[1]
+lowerBand = lowest(low,  donLen)[1]
+
+high > upperBand -> structure := +1
+low  < lowerBand -> structure := -1
+otherwise         -> unchanged
+```
+
+The `[1]` is essential: without it the current bar is contained in its own
+channel, and `high > highest(high, donLen)` could never be true. Comparing
+against the channel *as of the previous bar* is what makes a break detectable
+at all.
+
+Once a band breaks, the state persists until the opposite band breaks — the
+classical Donchian/Turtle definition of structure.
+
+This replaces Part A's swing-pivot component and fixes its worst property. A
+pivot cannot be confirmed until `pivotRight` further bars have closed, so that
+component was always reporting the past. A channel break is confirmed on the
+breaking bar itself: **zero confirmation lag**.
+
+## B3. Range position
+
+```
+mid      = (highest(high, posLen) + lowest(low, posLen)) / 2
+halfRng  = (highest(high, posLen) - lowest(low, posLen)) / 2
+position = (close - mid) / halfRng      clamped to [-1, +1]
+```
+
+Where price sits inside its own recent range: top of the range **+1**, bottom
+**−1**, middle **0**. This carries directional bias the way Part A's
+moving-average stack did, but computed from extremes rather than averages, so
+it contributes no averaging lag.
+
+## B4. Displacement balance
+
+```
+balance = (count of up closes - count of down closes) / balLen
+```
+
+Of the last `balLen` bars, how many closed up versus down. All up **+1**, all
+down **−1**, an even split **0**.
+
+Deliberately crude: it ignores the *size* of each move, and therefore cannot
+be dominated by a single outsized bar the way an average can. It is a counting
+rule, which makes it the most robust component of the four and the least
+sensitive to outliers.
+
+## The compression gate
+
+```
+rangeNow  = highest(high, expLen)      - lowest(low, expLen)
+rangePast = highest(high, expLen)[expLen] - lowest(low, expLen)[expLen]
+expansion = rangeNow / rangePast
+```
+
+Ground covered over the last `expLen` bars against ground covered over the
+`expLen` bars before that. Below 1 means the market is covering less than it
+was — coiling rather than travelling.
+
+Like the Choppiness Index it replaces, this gates **new** trend calls only. It
+never cancels an established one, because an ordinary pullback inside a real
+trend compresses the range too.
+
+## Composite score
+
+Because all four components already share the same `[-1, +1]` scale, the
+composite is a plain weighted average scaled to 100:
+
+```
+score = 100 × (wER·ER + wStruct·structure + wPos·position + wBal·balance)
+              ÷ (wER + wStruct + wPos + wBal)
+```
+
+giving a **Trend Score from −100 to +100**. Two consequences worth noting:
+
+- The weights mean exactly what they say, because no component can dominate
+  through scale. Part A summed `±1` votes, which discarded magnitude — a
+  barely-qualifying slope and an overwhelming one both contributed exactly 1.
+  Here a component's contribution is proportional to its strength.
+- Each component falls back to `0` when its inputs are not ready, so an
+  un-warmed component contributes nothing rather than nullifying the total.
+  (In Part A an unguarded `na` in a *sum* nullified the entire score — see
+  `AUDIT.md`, E1.)
+
+## Classification
+
+Identical in shape to Part A, and for the same reasons: a sticky state machine
+where entering a trend requires `|score| ≥ enterThresh` and leaving requires it
+to fall below the looser `exitThresh`, with the gap between them acting as a
+hysteresis dead zone; and state changes gated on bar close so a label cannot
+appear mid-bar and then vanish.
+
+Both of those are deterministic constructs — a comparison against a second
+fixed threshold, and a check on whether the bar has closed.
+
+## Warmup
+
+The longest default lookback is `expLen × 2 = 40` bars. The five-vote engine
+needed roughly **210** because of its 200-period moving average. The path
+geometry engine contains no moving averages at all, so it is usable on far
+shorter histories and on instruments without deep data.

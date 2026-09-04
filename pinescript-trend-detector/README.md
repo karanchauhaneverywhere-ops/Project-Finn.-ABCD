@@ -15,106 +15,124 @@ probabilistic.
 ```
 pinescript-trend-detector/
 ├── indicators/
-│   └── Deterministic_Trend_Detector.pine   # trend classifier + visuals/alerts
+│   └── Path_Geometry_Trend_Detector.pine   # trend classifier + trade overlay
 ├── strategies/
-│   └── Deterministic_Trend_Strategy.pine   # same classifier wired to entries/exits
-├── METHODOLOGY.md                          # formulas + rationale, component by component
+│   └── Deterministic_Trend_Strategy.pine   # entries/exits (older engine — see note)
+├── METHODOLOGY.md                          # formulas + rationale for both engines
+├── AUDIT.md                                # known defects and their status
 └── README.md                               # this file
 ```
 
+> ### ⚠ The indicator and the strategy currently use different engines
+>
+> The indicator was rewritten onto the **path geometry** engine described
+> below. The strategy still runs the older **five-vote** engine (least-squares
+> regression, Wilder ADX, Choppiness Index, swing pivots, moving averages),
+> documented in `METHODOLOGY.md` Part A.
+>
+> They do not measure the same thing, so **the indicator's entry markers are
+> not a preview of the strategy's trades right now.** Porting the strategy onto
+> the new engine is the outstanding work; until then, run them as two separate
+> tools rather than as a matched pair.
+
 ## How the classification works (summary)
 
-Five independent, deterministic components each cast a vote of `+1`
-(bullish), `-1` (bearish), or `0` (no signal):
+The premise: **a trend is a path that covers ground efficiently in one
+direction; a range is a path that travels just as far and arrives nowhere.**
+That is measurable directly from the price path — no line fitting, no
+smoothing, and no moving averages anywhere in the engine.
 
-1. **Regression slope + R²** — least-squares slope of price, ATR-normalized,
-   trusted only when the fit is linear enough (R² above a threshold).
-2. **Wilder DMI/ADX** — classical directional-movement strength/direction.
-3. **Choppiness Index** — a ranging-market filter that blocks new trend calls
-   while conditions are choppy (it does not cancel an established trend).
-4. **Swing structure (Dow Theory)** — higher-highs/higher-lows vs
-   lower-highs/lower-lows from confirmed pivots.
-5. **Moving-average geometry** — fast/mid/slow stack order + slow-MA slope.
+Four components, each normalized to `[-1, +1]`:
 
-The five votes sum to a score from -5 to +5, which drives a sticky state
-machine with hysteresis: entering a trend needs the score to reach
-`weakThresh`, leaving it needs the score to fall back to the looser
-`exitThresh`, and the state only advances on a closed bar. Every formula and
-threshold is documented in `METHODOLOGY.md`.
+1. **Signed Efficiency Ratio** — net displacement ÷ total path length over
+   `erLen` bars. A straight line up scores +1, a straight line down −1,
+   thrashing that returns to its origin 0. One number carrying both direction
+   and straightness.
+2. **Breakout structure** — `donLen`-bar channel breaks, held until the
+   opposite band breaks. Confirms on the breaking bar itself, unlike swing
+   pivots, which cannot confirm until N later bars have closed.
+3. **Range position** — where price sits inside its own recent high-low range,
+   measured from the midpoint. Directional bias with no averaging lag.
+4. **Displacement balance** — (up closes − down closes) ÷ window. A pure count,
+   so it can't be dominated by one outsized bar the way an average can.
 
-### Signal-accuracy behavior (v2)
+These are combined by weighted average into a **Trend Score of −100 to +100**.
+Because every component shares the same scale, the weights mean exactly what
+they say, and a component's contribution is proportional to its strength
+rather than being flattened into a ±1 vote.
 
-Both scripts were revised to make the printed signal match the underlying
-math more honestly:
+A **compression gate** (range now vs range before) blocks *new* trend calls
+while the market is coiling, without cancelling an established trend.
+
+The score drives a sticky state machine with hysteresis: entering a trend
+needs `|score| ≥ enterThresh`, leaving needs it to fall below the looser
+`exitThresh`, and the state only advances on a closed bar. Full formulas are
+in `METHODOLOGY.md` Part B.
+
+**Warmup is 40 bars** with the defaults, against ~210 for the previous engine,
+which needed a 200-period moving average before it could produce anything.
+
+### Signal discipline
+
+Three behaviours carry over from the previous engine because they were fixes
+for real problems, and they are independent of how the trend is measured:
 
 - **No intrabar flicker.** With `confirmOnClose` on (default), the state
   advances only on closed bars, so a label or alert can't appear mid-bar and
   then disappear before the bar closes.
-- **Hysteresis instead of a single boundary.** One point of score noise no
-  longer flips the label (and fires an alert) on back-to-back bars.
-- **Choppiness filters entries, not established trends**, so a transient chop
-  spike during a pullback no longer hides a strong trend. The table reports
-  chop status separately under "New entries".
-- **Alerts fire on direction changes**, not strength upgrades — an
-  Uptrend → Strong Uptrend move no longer re-fires "entered an UPTREND".
-- **Bug fix:** a zero-range Choppiness window returned `0`, the *trending* end
-  of the scale, making a dead-flat window read as a perfect trend. It now
-  returns `na`.
+- **Hysteresis, not a single boundary.** Entering a trend and leaving it use
+  different thresholds, so noise around one level can't flip the label — and
+  fire an alert — on back-to-back bars.
+- **Alerts fire on direction changes**, not strength upgrades: an
+  Uptrend → Strong Uptrend move doesn't re-fire "entered an uptrend".
 
 ## Using the indicator
 
 1. Open [TradingView](https://www.tradingview.com/), open any chart, then
    open the **Pine Editor** (bottom panel).
 2. Create a new script, paste in the contents of
-   `indicators/Deterministic_Trend_Detector.pine`, and click **Add to
-   chart**.
+   `indicators/Path_Geometry_Trend_Detector.pine`, and click **Add to chart**.
 3. On the chart you get:
-   - the regression line and the fast/mid/slow moving averages overlaid on
-     price,
-   - background shading that follows the current trend state,
-   - triangle markers on confirmed swing pivots,
-   - a breakdown table (top-right) showing the current label, composite
-     score, strength %, each component's reading, and how many bars the
-     current state has held.
-4. Right-click the chart → **Add alert**, and pick one of the built-in
-   alert conditions (entered uptrend / entered downtrend / entered sideways
-   / any state change) to get notified on trend transitions.
+   - the **breakout channel** (the `donLen` high/low bands whose breaks drive
+     the structure component),
+   - **background shading** following the current trend state,
+   - the **trade overlay** — entry labels, a ratcheting stop line, exit
+     markers (see below),
+   - a **breakdown table** (top-right) showing the trend state, the −100..+100
+     score, each of the four components' current readings, the compression
+     gate, bars in state, and the simulated position and stop.
+4. Right-click the chart → **Add alert** and pick a condition. The three
+   trend-state alerts describe market conditions; the four `TRADE:` alerts
+   describe entries and exits.
 
-All lengths and thresholds (regression window, ADX/DI lengths, Choppiness
-window and thresholds, pivot lookback, MA lengths/type, and the score
-thresholds that separate "Trend" from "Strong Trend") are exposed as inputs
-so the classifier can be tuned per instrument and timeframe.
+Every length, weight, and threshold is an input. The **component weights** are
+the main tuning surface — because all four components share the same
+`[-1, +1]` scale, setting a weight to 0 cleanly disables that component and
+lets you see what the others are contributing on their own.
 
 ### The trade overlay — read this before trading from the chart
 
 **The shaded background is a state, not a signal, and the two are not
-interchangeable.** The strategy enters on the single bar a trend first
-qualifies; the background stays lit for every bar the state holds, which may
-be dozens. Buying because the chart is green means entering the same trend
-much later than the strategy did, at a worse price, with no stop — a
-materially different trade from the one that gets backtested.
+interchangeable.** An entry is true for exactly one bar; the background stays
+lit for every bar the state holds, which may be dozens. Buying because the
+chart is green means entering the same trend far later, at a worse price, and
+with no stop — a materially different trade.
 
-So the indicator also draws the strategy's actual trade lifecycle
-(`Trade Overlay` input group, on by default):
+So the indicator draws the trade lifecycle explicitly (`Trade Overlay` input
+group, on by default):
 
-- **`LONG` / `SHORT` labels** mark the exact bar the strategy enters — the
+- **`LONG` / `SHORT` labels** mark the exact bar a trend first qualifies — the
   rising edge, not the ongoing state.
-- **A red chandelier stop line** tracks the live protective stop, ratcheting
-  in the trade's favor and never loosening. This is where most losing trades
-  actually end.
-- **`✕` marks a stop exit; `▫` marks a score exit** — the two distinct ways
-  the strategy closes a position.
-- **The table** reports the simulated position ("Long from 1.2345") and the
-  active stop price.
+- **A red chandelier stop line** tracks the protective stop, ratcheting in the
+  trade's favour and never loosening.
+- **`✕` marks a stop exit; `▫` marks a score exit** — the two ways a position
+  ends.
+- **The table** reports the position ("Long from 1.2345") and the active stop.
 - **Four `TRADE:` alert conditions** fire on entries and exits. If you want
-  alerts that correspond to trades, use those — the four trend-state alerts
-  describe market conditions, not trade instructions.
+  alerts that correspond to trades, use those.
 
-The overlay mirrors the strategy's fill model (entries and score exits at the
-bar close, the stop live intrabar at the level set on the prior close). It is
-a visual reconstruction rather than a bit-exact replay of TradingView's broker
-emulator, and it models no commission or slippage — so expect small
-differences against the Strategy Tester's trade list.
+The overlay models no commission or slippage, so its marker prices are
+optimistic against real fills.
 
 ## Using the strategy
 

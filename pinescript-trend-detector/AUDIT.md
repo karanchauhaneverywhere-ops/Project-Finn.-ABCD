@@ -3,6 +3,15 @@
 Findings from a line-by-line review of both scripts, ordered by severity.
 Line references below are as of commit `11af58b`, when the audit was written.
 
+> **Note (superseded in part):** the indicator has since been rewritten from
+> scratch onto the path geometry engine (`Path_Geometry_Trend_Detector.pine`).
+> Findings below that reference `Deterministic_Trend_Detector.pine` describe a
+> file that no longer exists; they are kept as the record of what went wrong
+> and what the rewrite had to avoid. All of them were carried into the new
+> file's design: every component falls back to 0 rather than na (E1), the stop
+> seeds on the entry bar and only ratchets (E2/E3), threshold inversions raise
+> runtime.error (E4/E8). The strategy findings all still apply as written.
+
 ## Status
 
 | # | Issue | Status |
