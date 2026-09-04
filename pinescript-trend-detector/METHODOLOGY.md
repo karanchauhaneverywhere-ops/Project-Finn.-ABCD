@@ -164,6 +164,145 @@ otherwise                                         -> Sideways / Range
 label. All thresholds are exposed as script inputs so they can be tuned per
 instrument/timeframe without changing the underlying math.
 
+## The VWAP layer (`indicators/VWAP_Confluence.pine`)
+
+The five components above all answer one question: *which way is price
+going?* None of them answer *is this a good price to act at?* The VWAP layer
+adds that second axis. It does not replace or re-weight any of the five
+votes — it runs the identical engine, then reports whether its own reading
+agrees.
+
+### Why VWAP is deterministic
+
+VWAP is the volume-weighted arithmetic mean transaction price since an
+anchor:
+
+```
+VWAP_t = Σ(p_i · v_i) / Σ(v_i)      for i from the anchor bar to t
+```
+
+where `p_i` is the chosen price source (default `hlc3`). This is a ratio of
+two running sums — a weighted average, nothing more. Given the same bars it
+returns the same number, with no distributional assumption and no parameter
+fitted to anything.
+
+The deviation bands use the **volume-weighted variance about that mean**:
+
+```
+σ²_t = Σ(v_i · (p_i − VWAP_t)²) / Σ(v_i)
+     = Σ(v_i · p_i²) / Σ(v_i) − VWAP_t²      (algebraically identical, one pass)
+```
+
+The script computes the second form so it can maintain three running sums
+instead of re-walking the window every bar; `math.max(σ², 0)` only clamps
+the floating-point rounding that can push a true zero fractionally negative.
+
+**This σ is a descriptive dispersion measure, not a confidence interval.**
+It is the root-mean-square distance of traded price from its own weighted
+mean over a finite, known set of bars — the same kind of closed-form
+descriptive statistic as the correlation coefficient used for R² above. The
+usual "2σ contains ~95% of observations" reading requires assuming normally
+distributed returns, which this toolkit explicitly rejects (real returns are
+fat-tailed and heteroskedastic). Nothing in the script makes, or depends on,
+any claim about how often price should sit inside a band. The bands are
+distance markers, drawn in a volatility-scaled unit. An ATR unit can be
+selected instead of σ, and the logic is unchanged either way.
+
+Because dispersion is meaningless in the first few bars after an anchor
+reset (σ starts at zero), the bands and the band vote are suppressed until
+`bandWarmup` bars have accumulated.
+
+### The three VWAP votes
+
+Each casts `+1` / `0` / `−1` on the same convention as the five trend
+components, summing to a VWAP score in `[−3, +3]`.
+
+**1. Side.** Is price accepted above or below the volume-weighted mean?
+
+```
+distATR = (close − VWAP) / ATR
+vote    = sign(distATR)  if |distATR| ≥ sideDeadATR,  else 0
+```
+
+The ATR dead zone (default 0.05) exists so price oscillating on top of VWAP
+casts no vote instead of alternating ±1 bar to bar.
+
+**2. Slope.** Which way is fair value itself moving? Normalized per bar and
+by ATR, on the same convention as the regression-slope vote:
+
+```
+slopeATR = (VWAP − VWAP[n]) / n / ATR
+vote     = sign(slopeATR)  if |slopeATR| ≥ vwapSlopeMinATR,  else 0
+```
+
+Price above a *falling* VWAP is a materially different condition from price
+above a *rising* one; the side vote alone cannot tell them apart.
+
+**3. Band zone.** Where does price sit in the envelope, in band units
+(`z = (close − VWAP) / bandUnit`)?
+
+```
+|z| ≤ mult1              ->  0   (at value; no directional read)
+mult1 < |z| ≤ mult3      -> ±1   (directional participation away from value)
+|z| > mult3              ->  0   (extended)
+```
+
+The outer case is worth stating explicitly: a tag of the outer band returns
+**0, not a counter-trend −1**. Treating "far from the mean" as a reversal
+signal is precisely a probability claim — that price reverts often enough
+for the bet to pay — and this toolkit does not make one. Extension is
+reported as an absence of a directional read, which is what the geometry
+actually supports.
+
+### Alignment and value entries
+
+`alignment` is a direct comparison of the two independent readings:
+
+```
+trend label is Up*   and vwapScore > 0  -> Aligned LONG
+trend label is Down* and vwapScore < 0  -> Aligned SHORT
+the two disagree in sign                 -> Conflicted
+otherwise                                -> Neutral
+```
+
+Both scores are in the same `{−1, 0, +1}` vote units, so they also sum
+directly into `combinedScore ∈ [−8, +8]`.
+
+The value-entry signal is a three-state machine over hard comparisons on
+closed bars — it stores one boolean, and never looks ahead:
+
+```
+ARM       trend label is Up  AND  low ≤ VWAP + pullbackATR·ATR
+CANCEL    trend label leaves Up  OR  close < VWAP − invalidATR·ATR
+TRIGGER   armed  AND  close > VWAP + triggerATR·ATR  AND  cooldown elapsed
+```
+
+(mirrored for shorts). Arming is evaluated *before* cancelling on each bar,
+so a bar that trades down to value and then closes straight through it is a
+failed reclaim and ends the bar disarmed, rather than arming on its own low.
+
+The purpose is location, not extra prediction: the trend engine already
+decided the direction, and this only changes *where* that direction gets
+acted on — at fair value on a pullback, rather than wherever the score
+happened to cross. The trade-off is disclosed rather than hidden: in a trend
+that never returns to VWAP, this fires no signal at all and the move is
+missed entirely. That is the cost of insisting on location.
+
+### Additional limitations of this layer
+
+- **VWAP requires volume.** On symbols with no volume feed (many indices,
+  some FX sources) the weighted mean is undefined, not merely inaccurate.
+  The script detects this and says so in its table rather than plotting a
+  misleading line.
+- **The anchor must be shorter than the chart timeframe is long.** A
+  "Session" anchor on a daily-or-higher chart resets every bar, making VWAP
+  equal to that bar's own price source. Use an intraday chart, or a longer
+  anchor.
+- **Anchored VWAP is path-dependent by construction.** Its value at bar *t*
+  depends on where the anchor was placed. Two traders using different
+  anchors get different "fair values", and neither is more correct — the
+  anchor is a choice about which participants' cost basis you care about.
+
 ## Known limitations (disclosed, not hidden)
 
 - **Pivot confirmation lag.** The swing-structure vote can only update

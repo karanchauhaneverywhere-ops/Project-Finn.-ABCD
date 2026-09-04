@@ -1,0 +1,557 @@
+//@version=6
+
+// =============================================================================
+// VWAP Confluence [Finn]
+// -----------------------------------------------------------------------------
+// A Volume-Weighted Average Price layer built to sit alongside — and agree
+// bar-for-bar with — ./Deterministic_Trend_Detector.pine.
+//
+// Why VWAP belongs in this toolkit
+// --------------------------------
+// The five existing components all answer the same question: "which way is
+// price going?" None of them answer "is this a good *price* to act at?" A
+// trend follower that enters the instant its score crosses a threshold buys
+// wherever price happens to be at that moment — frequently well extended
+// from any reference value, which is exactly where give-back comes from.
+//
+// VWAP is the volume-weighted arithmetic mean transaction price since an
+// anchor. It is a *location* reference, not a direction forecast. Pairing it
+// with the trend engine gives the missing half: direction from the score,
+// location from VWAP.
+//
+// This script therefore does three things:
+//
+//   1. Plots anchored (or rolling) VWAP with deviation bands.
+//   2. Casts three deterministic VWAP votes in the same {-1, 0, +1} scheme the
+//      trend engine uses, summing to a VWAP score in [-3, +3].
+//   3. Re-runs the identical five-component trend engine (duplicated in-file,
+//      same reason the strategy duplicates it: TradingView scripts cannot
+//      share code without publishing a separate Pine *library*) so it can
+//      report an ALIGNMENT verdict and fire "value entry" signals — a
+//      pullback to VWAP taken only in the direction the trend engine already
+//      confirms.
+//
+// Determinism
+// -----------
+// VWAP is a weighted arithmetic mean: a closed-form ratio of two sums. The
+// deviation bands use the volume-weighted variance about that mean, which is
+// a *descriptive* dispersion measure — a root-mean-square distance, computed
+// exactly from the bars in the window. It is NOT a confidence interval: no
+// return distribution is assumed, and a "2-sigma band" here carries no claim
+// about how often price should sit inside it. See ../METHODOLOGY.md.
+//
+// This script is for research/education. It is not financial advice.
+// =============================================================================
+// max_bars_back is set explicitly because the VWAP slope reads history at a
+// user-supplied index off a series derived from `var` accumulators, which is
+// the case Pine's automatic history-buffer inference cannot always size.
+indicator("VWAP Confluence [Finn]", shorttitle = "VWAPC", overlay = true, max_bars_back = 500)
+
+// -----------------------------------------------------------------------------
+// Inputs — VWAP core
+// -----------------------------------------------------------------------------
+grpVwap = "VWAP Anchor"
+anchorMode = input.string("Session", "Anchor", options = ["Session", "Week", "Month", "Quarter", "Year", "Custom date", "Rolling (N bars)"], group = grpVwap, tooltip = "Session/Week/Month/... reset the accumulation at each new period. 'Rolling (N bars)' never resets - it uses a moving window instead. On a chart whose timeframe is >= the anchor period the anchored modes degenerate (each bar is its own period); use a lower chart timeframe or a longer anchor.")
+srcPrice   = input.source(hlc3, "Price source", group = grpVwap)
+rollLen    = input.int(200, "Rolling window (bars, 'Rolling' anchor only)", minval = 2, group = grpVwap)
+customAnchorTime = input.time(timestamp("01 Jan 2024 00:00 +0000"), "Custom anchor date ('Custom date' only)", group = grpVwap)
+
+grpBands = "Deviation Bands"
+bandBasis   = input.string("Volume-weighted sigma", "Band unit", options = ["Volume-weighted sigma", "ATR"], group = grpBands, tooltip = "Sigma = volume-weighted RMS distance of price from VWAP since the anchor. This is a descriptive spread measure, NOT a confidence interval.")
+bandMult1   = input.float(1.0, "Inner band multiple", minval = 0.1, step = 0.1, group = grpBands)
+bandMult2   = input.float(2.0, "Mid band multiple", minval = 0.1, step = 0.1, group = grpBands)
+bandMult3   = input.float(3.0, "Outer band multiple", minval = 0.1, step = 0.1, group = grpBands)
+bandWarmup  = input.int(5, "Bars after anchor before bands are considered valid", minval = 1, group = grpBands, tooltip = "Immediately after an anchor reset the dispersion is near zero, which would make the bands meaningless and the band vote spurious. Both are suppressed until this many bars have accumulated.")
+
+grpVotes = "VWAP Votes"
+sideDeadATR       = input.float(0.05, "Side vote dead zone, in ATRs", minval = 0.0, step = 0.01, group = grpVotes, tooltip = "Price must sit at least this far from VWAP before the side vote fires, so a price oscillating on top of VWAP casts no vote.")
+vwapSlopeLookback = input.int(10, "VWAP slope lookback", minval = 1, group = grpVotes)
+vwapSlopeMinATR   = input.float(0.01, "Minimum |VWAP slope| in ATRs/bar", minval = 0.0, step = 0.005, group = grpVotes)
+
+// -----------------------------------------------------------------------------
+// Inputs — trend engine (identical to Deterministic_Trend_Detector.pine)
+// -----------------------------------------------------------------------------
+grpReg = "Trend: Regression (slope + linearity)"
+regLen      = input.int(34, "Regression length", minval = 5, group = grpReg)
+atrLen      = input.int(14, "ATR length (normalization)", minval = 1, group = grpReg)
+rSquaredMin = input.float(0.35, "Minimum R^2 to trust slope direction", minval = 0.0, maxval = 1.0, step = 0.05, group = grpReg)
+slopeMinATR = input.float(0.03, "Minimum |slope| in ATRs/bar", minval = 0.0, step = 0.01, group = grpReg)
+
+grpDmi = "Trend: Directional Movement (Wilder)"
+diLen        = input.int(14, "DI length", minval = 1, group = grpDmi)
+adxSmooth    = input.int(14, "ADX smoothing", minval = 1, group = grpDmi)
+adxThreshold = input.float(20.0, "ADX trend threshold", minval = 0, group = grpDmi)
+
+grpChop = "Trend: Choppiness Index"
+chopLen         = input.int(14, "Choppiness length", minval = 2, group = grpChop)
+chopSidewaysMin = input.float(61.8, "Choppiness >= this => sideways", group = grpChop)
+chopOverride    = input.bool(true, "Let Choppiness force the 'Sideways' label", group = grpChop)
+
+grpStruct = "Trend: Swing Structure (Dow Theory)"
+pivotLeft  = input.int(5, "Pivot left bars", minval = 1, group = grpStruct)
+pivotRight = input.int(5, "Pivot right bars", minval = 1, group = grpStruct)
+
+grpMa = "Trend: Moving Average Geometry"
+maType        = input.string("EMA", "MA type", options = ["EMA", "SMA", "WMA", "HMA", "RMA"], group = grpMa)
+fastLen       = input.int(21, "Fast MA length", minval = 1, group = grpMa)
+midLen        = input.int(55, "Mid MA length", minval = 1, group = grpMa)
+slowLen       = input.int(200, "Slow MA length", minval = 1, group = grpMa)
+slopeLookback = input.int(10, "Slow MA slope lookback", minval = 1, group = grpMa)
+
+grpScore = "Trend: Composite Classification"
+strongThresh = input.int(4, "Score >= this => Strong trend", minval = 1, maxval = 5, group = grpScore)
+weakThresh   = input.int(2, "Score >= this => Trend", minval = 1, maxval = 5, group = grpScore)
+
+// -----------------------------------------------------------------------------
+// Inputs — value-entry signals
+// -----------------------------------------------------------------------------
+grpSig = "Value Entry Signals"
+showSignals   = input.bool(true, "Show value-entry signals", group = grpSig)
+pullbackATR   = input.float(0.0, "Arm when price trades within this many ATRs of VWAP", minval = 0.0, step = 0.1, group = grpSig, tooltip = "0 means the bar's low must actually reach VWAP (or the high must reach it, for shorts).")
+triggerATR    = input.float(0.0, "Fire when close reclaims VWAP by this many ATRs", minval = 0.0, step = 0.1, group = grpSig)
+invalidATR    = input.float(1.5, "Cancel a setup once close is this many ATRs the wrong side of VWAP", minval = 0.1, step = 0.1, group = grpSig)
+signalCooldown = input.int(3, "Minimum bars between signals", minval = 0, group = grpSig)
+
+grpDisp = "Display"
+showVwap      = input.bool(true, "Plot VWAP", group = grpDisp)
+showBands     = input.bool(true, "Plot deviation bands", group = grpDisp)
+showBandFill  = input.bool(true, "Shade band zones", group = grpDisp)
+showPrevVwap  = input.bool(true, "Plot previous period's closing VWAP", group = grpDisp)
+showAnchorMark = input.bool(false, "Mark anchor resets", group = grpDisp)
+showTable     = input.bool(true, "Show breakdown table", group = grpDisp)
+tablePos      = input.string("bottom_right", "Table position", options = ["top_right", "middle_right", "bottom_right", "top_left", "bottom_left"], group = grpDisp, tooltip = "Defaults to bottom-right so it does not collide with the Deterministic Trend Detector's own table (top-right) when both are on the chart.")
+
+// =============================================================================
+// SECTION A — VWAP, deviation bands, and VWAP votes
+// =============================================================================
+
+// -----------------------------------------------------------------------------
+// A1. Anchor detection
+//     All timeframe.change() calls are evaluated unconditionally on every bar
+//     (never inside a branch) so each keeps a consistent history series; the
+//     anchor selection is a plain ternary over the already-computed values.
+// -----------------------------------------------------------------------------
+chgSession = timeframe.change("D")
+chgWeek    = timeframe.change("W")
+chgMonth   = timeframe.change("M")
+chgQuarter = timeframe.change("3M")
+chgYear    = timeframe.change("12M")
+
+useRolling = anchorMode == "Rolling (N bars)"
+
+anchorActive = anchorMode != "Custom date" or time >= customAnchorTime
+var bool prevAnchorActive = false
+customStart = anchorActive and not prevAnchorActive
+prevAnchorActive := anchorActive
+
+newPeriod = anchorMode == "Session" ? chgSession :
+     anchorMode == "Week" ? chgWeek :
+     anchorMode == "Month" ? chgMonth :
+     anchorMode == "Quarter" ? chgQuarter :
+     anchorMode == "Year" ? chgYear :
+     anchorMode == "Custom date" ? customStart :
+     false
+
+// -----------------------------------------------------------------------------
+// A2. Anchored VWAP and volume-weighted dispersion
+//
+//     VWAP    = SUM(p_i * v_i) / SUM(v_i)
+//     sigma^2 = SUM(v_i * p_i^2) / SUM(v_i) - VWAP^2      (weighted variance)
+//
+//     The second form is the algebraically identical, single-pass version of
+//     SUM(v_i * (p_i - VWAP)^2) / SUM(v_i). math.max(..., 0) only clamps the
+//     floating-point rounding that can push a true zero fractionally negative.
+// -----------------------------------------------------------------------------
+barVol = nz(volume)
+
+var float cumPV  = 0.0
+var float cumV   = 0.0
+var float cumPV2 = 0.0
+var int   anchorBars = 0
+
+if newPeriod
+    cumPV  := 0.0
+    cumV   := 0.0
+    cumPV2 := 0.0
+    anchorBars := 0
+
+if anchorActive
+    cumPV  += srcPrice * barVol
+    cumV   += barVol
+    cumPV2 += srcPrice * srcPrice * barVol
+    anchorBars += 1
+
+anchoredVwap  = cumV != 0 ? cumPV / cumV : na
+anchoredVar   = cumV != 0 ? math.max(cumPV2 / cumV - anchoredVwap * anchoredVwap, 0.0) : na
+anchoredSigma = math.sqrt(anchoredVar)
+
+// Rolling-window equivalents of the same two formulas.
+rollPV  = math.sum(srcPrice * barVol, rollLen)
+rollV   = math.sum(barVol, rollLen)
+rollPV2 = math.sum(srcPrice * srcPrice * barVol, rollLen)
+
+rollVwap  = rollV != 0 ? rollPV / rollV : na
+rollVar   = rollV != 0 ? math.max(rollPV2 / rollV - rollVwap * rollVwap, 0.0) : na
+rollSigma = math.sqrt(rollVar)
+
+vwapVal   = useRolling ? rollVwap : anchoredVwap
+vwapSigma = useRolling ? rollSigma : anchoredSigma
+
+// Some symbols (many indices, some FX feeds) publish no volume at all, which
+// makes a volume-weighted mean undefined rather than merely inaccurate.
+volumeMissing = useRolling ? rollV == 0 : (anchorActive and cumV == 0)
+
+// Previous period's final VWAP — a frequently-respected reference level.
+var float prevPeriodVwap = na
+if newPeriod
+    prevPeriodVwap := nz(anchoredVwap[1], prevPeriodVwap)
+
+// -----------------------------------------------------------------------------
+// A3. Bands
+// -----------------------------------------------------------------------------
+atrVal = ta.atr(atrLen)
+
+bandUnit   = bandBasis == "ATR" ? atrVal : vwapSigma
+bandsValid = not na(vwapVal) and not na(bandUnit) and bandUnit > 0 and (useRolling or anchorBars >= bandWarmup)
+
+upper1 = bandsValid ? vwapVal + bandMult1 * bandUnit : na
+upper2 = bandsValid ? vwapVal + bandMult2 * bandUnit : na
+upper3 = bandsValid ? vwapVal + bandMult3 * bandUnit : na
+lower1 = bandsValid ? vwapVal - bandMult1 * bandUnit : na
+lower2 = bandsValid ? vwapVal - bandMult2 * bandUnit : na
+lower3 = bandsValid ? vwapVal - bandMult3 * bandUnit : na
+
+zPos = bandsValid ? (close - vwapVal) / bandUnit : na
+
+// -----------------------------------------------------------------------------
+// A4. VWAP vote 1 — side (is price accepted above or below the volume-weighted
+//     mean transaction price?), with an ATR dead zone so price sitting on top
+//     of VWAP casts no vote.
+// -----------------------------------------------------------------------------
+vwapDistATR = (not na(vwapVal) and atrVal != 0) ? (close - vwapVal) / atrVal : 0.0
+voteVwapSide = math.abs(vwapDistATR) >= sideDeadATR ? int(math.sign(vwapDistATR)) : 0
+
+// -----------------------------------------------------------------------------
+// A5. VWAP vote 2 — slope of fair value itself, per bar, ATR-normalized on the
+//     same convention as the trend engine's regression slope.
+// -----------------------------------------------------------------------------
+vwapSlopePerBar = (not na(vwapVal) and not na(vwapVal[vwapSlopeLookback]) and atrVal != 0) ?
+     (vwapVal - vwapVal[vwapSlopeLookback]) / vwapSlopeLookback / atrVal : 0.0
+voteVwapSlope = math.abs(vwapSlopePerBar) >= vwapSlopeMinATR ? int(math.sign(vwapSlopePerBar)) : 0
+
+// -----------------------------------------------------------------------------
+// A6. VWAP vote 3 — band zone.
+//
+//     Inside the inner band  -> 0  (price is at value; no directional read)
+//     Inner..outer band      -> +/-1 (directional participation away from value)
+//     Beyond the outer band  -> 0  (extended; deliberately neutral rather than
+//                                   counter-trend, because calling an outer-band
+//                                   tag a reversal would be a claim about how
+//                                   often price reverts — a probability
+//                                   statement this toolkit does not make)
+// -----------------------------------------------------------------------------
+voteVwapBand = not bandsValid ? 0 :
+     (zPos > bandMult1 and zPos <= bandMult3) ? 1 :
+     (zPos < -bandMult1 and zPos >= -bandMult3) ? -1 :
+     0
+
+vwapScore = voteVwapSide + voteVwapSlope + voteVwapBand
+
+vwapState = not bandsValid ? "Warming up" :
+     zPos > bandMult3 ? "Above value (extended)" :
+     zPos > bandMult1 ? "Above value (trending)" :
+     zPos >= -bandMult1 ? "At value" :
+     zPos >= -bandMult3 ? "Below value (trending)" :
+     "Below value (extended)"
+
+// =============================================================================
+// SECTION B — the five-component trend engine, duplicated verbatim from
+// ./Deterministic_Trend_Detector.pine so the alignment verdict below is the
+// same label that indicator shows on the same bar.
+// =============================================================================
+
+// -----------------------------------------------------------------------------
+// B1. Least-squares regression: ATR-normalized slope + R^2 (linearity)
+// -----------------------------------------------------------------------------
+regNow  = ta.linreg(close, regLen, 0)
+regPrev = ta.linreg(close, regLen, 1)
+slope   = regNow - regPrev
+normSlope = atrVal != 0 ? slope / atrVal : 0.0
+
+corr     = ta.correlation(close, bar_index, regLen)
+rSquared = math.pow(corr, 2)
+
+voteRegression = (rSquared >= rSquaredMin and math.abs(normSlope) >= slopeMinATR) ? int(math.sign(normSlope)) : 0
+
+// -----------------------------------------------------------------------------
+// B2. Wilder Directional Movement Index / ADX
+// -----------------------------------------------------------------------------
+upMove   = high - high[1]
+downMove = low[1] - low
+plusDM   = (upMove > downMove and upMove > 0) ? upMove : 0.0
+minusDM  = (downMove > upMove and downMove > 0) ? downMove : 0.0
+trSmooth = ta.rma(ta.tr(true), diLen)
+plusDI   = trSmooth != 0 ? 100 * ta.rma(plusDM, diLen) / trSmooth : 0.0
+minusDI  = trSmooth != 0 ? 100 * ta.rma(minusDM, diLen) / trSmooth : 0.0
+dx       = (plusDI + minusDI) != 0 ? 100 * math.abs(plusDI - minusDI) / (plusDI + minusDI) : 0.0
+adxValue = ta.rma(dx, adxSmooth)
+
+dmiDir  = plusDI > minusDI ? 1 : (plusDI < minusDI ? -1 : 0)
+voteADX = adxValue >= adxThreshold ? dmiDir : 0
+
+// -----------------------------------------------------------------------------
+// B3. Choppiness Index (E.W. Dreiss)
+// -----------------------------------------------------------------------------
+chopRange    = ta.highest(high, chopLen) - ta.lowest(low, chopLen)
+chop         = chopRange != 0 ? 100 * math.log10(math.sum(ta.tr(true), chopLen) / chopRange) / math.log10(chopLen) : 0.0
+chopSideways = chop >= chopSidewaysMin
+
+// -----------------------------------------------------------------------------
+// B4. Swing structure — Dow Theory HH/HL vs LH/LL from confirmed pivots
+// -----------------------------------------------------------------------------
+pivHigh = ta.pivothigh(pivotLeft, pivotRight)
+pivLow  = ta.pivotlow(pivotLeft, pivotRight)
+
+var float lastPH = na
+var float prevPH = na
+var float lastPL = na
+var float prevPL = na
+
+if not na(pivHigh)
+    prevPH := lastPH
+    lastPH := pivHigh
+if not na(pivLow)
+    prevPL := lastPL
+    lastPL := pivLow
+
+var int voteStructure = 0
+
+if not na(lastPH) and not na(prevPH) and not na(lastPL) and not na(prevPL)
+    bool hh = lastPH > prevPH
+    bool hl = lastPL > prevPL
+    bool lh = lastPH < prevPH
+    bool ll = lastPL < prevPL
+    if hh and hl
+        voteStructure := 1
+    else if lh and ll
+        voteStructure := -1
+    else
+        voteStructure := 0
+
+// -----------------------------------------------------------------------------
+// B5. Moving-average geometry: stack alignment + slow-MA slope
+// -----------------------------------------------------------------------------
+f_ma(src, len, kind) =>
+    switch kind
+        "EMA" => ta.ema(src, len)
+        "SMA" => ta.sma(src, len)
+        "WMA" => ta.wma(src, len)
+        "HMA" => ta.hma(src, len)
+        "RMA" => ta.rma(src, len)
+        => ta.ema(src, len)
+
+fastMA = f_ma(close, fastLen, maType)
+midMA  = f_ma(close, midLen, maType)
+slowMA = f_ma(close, slowLen, maType)
+
+voteStack = (fastMA > midMA and midMA > slowMA) ? 1 : ((fastMA < midMA and midMA < slowMA) ? -1 : 0)
+
+maSlope     = slowMA - slowMA[slopeLookback]
+voteMASlope = int(math.sign(maSlope))
+
+// -----------------------------------------------------------------------------
+// B6. Composite score & classification
+// -----------------------------------------------------------------------------
+rawScore = voteRegression + voteADX + voteStructure + voteStack + voteMASlope
+
+string trendState = "Sideways / Range"
+if chopOverride and chopSideways
+    trendState := "Sideways / Range"
+else if rawScore >= strongThresh
+    trendState := "Strong Uptrend"
+else if rawScore >= weakThresh
+    trendState := "Uptrend"
+else if rawScore <= -strongThresh
+    trendState := "Strong Downtrend"
+else if rawScore <= -weakThresh
+    trendState := "Downtrend"
+else
+    trendState := "Sideways / Range"
+
+trendUp   = trendState == "Uptrend" or trendState == "Strong Uptrend"
+trendDown = trendState == "Downtrend" or trendState == "Strong Downtrend"
+
+// =============================================================================
+// SECTION C — alignment and value-entry signals
+// =============================================================================
+
+// -----------------------------------------------------------------------------
+// C1. Alignment verdict: does the location read agree with the direction read?
+// -----------------------------------------------------------------------------
+alignedLong  = trendUp   and vwapScore > 0
+alignedShort = trendDown and vwapScore < 0
+conflicted   = (trendUp and vwapScore < 0) or (trendDown and vwapScore > 0)
+
+alignment = alignedLong ? "Aligned LONG" :
+     alignedShort ? "Aligned SHORT" :
+     conflicted ? "Conflicted" :
+     "Neutral"
+
+// Trend score and VWAP score share the same {-1,0,+1} vote units, so they are
+// directly summable into one reading in [-8, +8].
+combinedScore = rawScore + vwapScore
+
+// -----------------------------------------------------------------------------
+// C2. Value entry: a pullback INTO VWAP, taken only in the trend's direction.
+//
+//     Armed      — the trend engine confirms a direction AND this bar traded
+//                  back to (within pullbackATR of) fair value.
+//     Triggered  — a later bar closes back through VWAP by triggerATR, i.e.
+//                  value was reclaimed rather than lost.
+//     Cancelled  — the trend label leaves that direction, or price closes
+//                  invalidATR beyond VWAP on the wrong side.
+//
+//     All three are hard comparisons on the current bar's closed values; the
+//     state variables only carry a boolean forward, never a lookahead.
+// -----------------------------------------------------------------------------
+var bool longArmed  = false
+var bool shortArmed = false
+var int  lastSignalBar = na
+
+// The state machine runs regardless of the display toggle, so hiding the
+// markers never changes which bars would have signalled (or the alerts).
+engineReady = not na(vwapVal) and not na(atrVal)
+
+// Arm BEFORE cancelling, so a bar that trades down to value and then closes
+// straight through it counts as a failed reclaim and ends the bar disarmed,
+// rather than arming on its own low.
+if engineReady and trendUp and low <= vwapVal + pullbackATR * atrVal
+    longArmed := true
+if engineReady and trendDown and high >= vwapVal - pullbackATR * atrVal
+    shortArmed := true
+
+longCancelled  = not trendUp   or (engineReady and close < vwapVal - invalidATR * atrVal)
+shortCancelled = not trendDown or (engineReady and close > vwapVal + invalidATR * atrVal)
+
+if longCancelled
+    longArmed := false
+if shortCancelled
+    shortArmed := false
+
+cooldownOK = na(lastSignalBar) or (bar_index - lastSignalBar) > signalCooldown
+
+longSignal  = engineReady and longArmed  and cooldownOK and close > vwapVal + triggerATR * atrVal
+shortSignal = engineReady and shortArmed and cooldownOK and close < vwapVal - triggerATR * atrVal
+
+if longSignal
+    longArmed := false
+    lastSignalBar := bar_index
+if shortSignal
+    shortArmed := false
+    lastSignalBar := bar_index
+
+setupState = longSignal ? "LONG value entry" :
+     shortSignal ? "SHORT value entry" :
+     longArmed ? "Long armed - awaiting reclaim" :
+     shortArmed ? "Short armed - awaiting reclaim" :
+     "Idle"
+
+// =============================================================================
+// SECTION D — visuals
+// =============================================================================
+vwapColor = alignedLong ? color.new(color.lime, 0) :
+     alignedShort ? color.new(color.red, 0) :
+     color.new(color.blue, 0)
+
+plot(showVwap ? vwapVal : na, "VWAP", color = vwapColor, linewidth = 2)
+plot(showPrevVwap ? prevPeriodVwap : na, "Previous period VWAP", color = color.new(color.gray, 30), style = plot.style_stepline)
+
+pU1 = plot(showBands ? upper1 : na, "Upper 1", color = color.new(color.blue, 60))
+pU2 = plot(showBands ? upper2 : na, "Upper 2", color = color.new(color.blue, 70))
+pU3 = plot(showBands ? upper3 : na, "Upper 3", color = color.new(color.blue, 80))
+pL1 = plot(showBands ? lower1 : na, "Lower 1", color = color.new(color.blue, 60))
+pL2 = plot(showBands ? lower2 : na, "Lower 2", color = color.new(color.blue, 70))
+pL3 = plot(showBands ? lower3 : na, "Lower 3", color = color.new(color.blue, 80))
+
+fill(pU1, pL1, color = (showBands and showBandFill) ? color.new(color.blue, 93) : na, title = "Value zone")
+fill(pU1, pU2, color = (showBands and showBandFill) ? color.new(color.blue, 90) : na, title = "Upper mid zone")
+fill(pL1, pL2, color = (showBands and showBandFill) ? color.new(color.blue, 90) : na, title = "Lower mid zone")
+fill(pU2, pU3, color = (showBands and showBandFill) ? color.new(color.blue, 87) : na, title = "Upper outer zone")
+fill(pL2, pL3, color = (showBands and showBandFill) ? color.new(color.blue, 87) : na, title = "Lower outer zone")
+
+bgcolor(showAnchorMark and newPeriod ? color.new(color.gray, 80) : na, title = "Anchor reset")
+
+plotshape(showSignals and longSignal, title = "Long value entry", style = shape.triangleup, location = location.belowbar, color = color.new(color.lime, 0), size = size.small, text = "VWAP+")
+plotshape(showSignals and shortSignal, title = "Short value entry", style = shape.triangledown, location = location.abovebar, color = color.new(color.red, 0), size = size.small, text = "VWAP-")
+
+// Numeric detail kept off the visible chart, available in the Data Window
+plot(vwapVal, "VWAP value", display = display.data_window)
+plot(bandUnit, "Band unit", display = display.data_window)
+plot(zPos, "Z-position (band units)", display = display.data_window)
+plot(vwapSlopePerBar, "VWAP slope (ATRs/bar)", display = display.data_window)
+plot(vwapScore, "VWAP score", display = display.data_window)
+plot(rawScore, "Trend score", display = display.data_window)
+plot(combinedScore, "Combined score", display = display.data_window)
+plot(anchorBars, "Bars since anchor", display = display.data_window)
+
+// -----------------------------------------------------------------------------
+// Breakdown table
+// -----------------------------------------------------------------------------
+f_tablePos(p) =>
+    switch p
+        "top_right"    => position.top_right
+        "middle_right" => position.middle_right
+        "bottom_right" => position.bottom_right
+        "top_left"     => position.top_left
+        "bottom_left"  => position.bottom_left
+        => position.bottom_right
+
+var table infoTable = table.new(f_tablePos(tablePos), 2, 15, border_width = 1)
+
+f_cell(t, row, label, value, valColor) =>
+    table.cell(t, 0, row, label, text_color = color.white, bgcolor = color.new(color.black, 30), text_size = size.small)
+    table.cell(t, 1, row, value, text_color = valColor, bgcolor = color.new(color.black, 30), text_size = size.small)
+
+f_voteText(v) =>
+    v == 1 ? "+1 bullish" : (v == -1 ? "-1 bearish" : "0 neutral")
+
+f_voteColor(v) =>
+    v == 1 ? color.lime : (v == -1 ? color.red : color.silver)
+
+if showTable and barstate.islast
+    alignColor = alignedLong ? color.lime : (alignedShort ? color.red : (conflicted ? color.orange : color.silver))
+    trendColor = trendUp ? color.lime : (trendDown ? color.red : color.silver)
+
+    f_cell(infoTable, 0, "Alignment", alignment, alignColor)
+    f_cell(infoTable, 1, "Setup", setupState, (longArmed or shortArmed or longSignal or shortSignal) ? color.yellow : color.silver)
+    f_cell(infoTable, 2, "Combined score", str.tostring(combinedScore) + " / 8", color.white)
+    f_cell(infoTable, 3, "Trend state", trendState + " (" + str.tostring(rawScore) + "/5)", trendColor)
+    f_cell(infoTable, 4, "VWAP state", vwapState, color.white)
+    f_cell(infoTable, 5, "VWAP score", str.tostring(vwapScore) + " / 3", color.white)
+    f_cell(infoTable, 6, "  Side vote", f_voteText(voteVwapSide), f_voteColor(voteVwapSide))
+    f_cell(infoTable, 7, "  Slope vote", f_voteText(voteVwapSlope), f_voteColor(voteVwapSlope))
+    f_cell(infoTable, 8, "  Band vote", f_voteText(voteVwapBand), f_voteColor(voteVwapBand))
+    f_cell(infoTable, 9, "Anchor", anchorMode + (useRolling ? " (" + str.tostring(rollLen) + ")" : ""), color.white)
+    f_cell(infoTable, 10, "Bars since anchor", useRolling ? "n/a" : str.tostring(anchorBars), color.white)
+    f_cell(infoTable, 11, "VWAP", na(vwapVal) ? "n/a" : str.tostring(vwapVal, format.mintick), color.white)
+    f_cell(infoTable, 12, "Band unit (" + (bandBasis == "ATR" ? "ATR" : "sigma") + ")", na(bandUnit) ? "n/a" : str.tostring(bandUnit, format.mintick), color.white)
+    f_cell(infoTable, 13, "Z-position", bandsValid ? str.tostring(zPos, "#.##") : "warming up", color.white)
+    if volumeMissing
+        f_cell(infoTable, 14, "WARNING", "No volume on this symbol - VWAP is undefined", color.orange)
+
+// -----------------------------------------------------------------------------
+// Alerts
+// -----------------------------------------------------------------------------
+crossedAboveVwap = not na(vwapVal) and ta.crossover(close, vwapVal)
+crossedBelowVwap = not na(vwapVal) and ta.crossunder(close, vwapVal)
+alignmentChanged = alignment != alignment[1]
+
+alertcondition(longSignal, title = "VWAP value entry (long)", message = "VWAP Confluence: {{ticker}} pulled back to VWAP and reclaimed it inside a confirmed UPTREND on {{interval}}")
+alertcondition(shortSignal, title = "VWAP value entry (short)", message = "VWAP Confluence: {{ticker}} rallied to VWAP and lost it again inside a confirmed DOWNTREND on {{interval}}")
+alertcondition(alignmentChanged and alignedLong, title = "Alignment turned long", message = "VWAP Confluence: {{ticker}} trend and VWAP are now ALIGNED LONG on {{interval}}")
+alertcondition(alignmentChanged and alignedShort, title = "Alignment turned short", message = "VWAP Confluence: {{ticker}} trend and VWAP are now ALIGNED SHORT on {{interval}}")
+alertcondition(alignmentChanged and conflicted, title = "Alignment conflicted", message = "VWAP Confluence: {{ticker}} trend direction and VWAP location now DISAGREE on {{interval}}")
+alertcondition(crossedAboveVwap, title = "Price crossed above VWAP", message = "VWAP Confluence: {{ticker}} crossed above VWAP on {{interval}}")
+alertcondition(crossedBelowVwap, title = "Price crossed below VWAP", message = "VWAP Confluence: {{ticker}} crossed below VWAP on {{interval}}")
+alertcondition(bandsValid and high >= upper3, title = "Tagged upper outer band", message = "VWAP Confluence: {{ticker}} tagged the upper outer VWAP band on {{interval}}")
+alertcondition(bandsValid and low <= lower3, title = "Tagged lower outer band", message = "VWAP Confluence: {{ticker}} tagged the lower outer VWAP band on {{interval}}")
