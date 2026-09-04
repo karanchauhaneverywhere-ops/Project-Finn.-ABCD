@@ -1,0 +1,33 @@
+{
+  "_comment": "This is the JSON payload shape emitted by strategy.pine's alert() calls. Point a TradingView webhook alert at your relay/bot endpoint; the relay is responsible for translating this into a real broker order plus its own risk controls (duplicate-alert guard, daily loss limit, kill switch).",
+
+  "example_buy_alert": {
+    "action": "buy",
+    "symbol": "{{ticker}}",
+    "price": "{{close}}",
+    "stop": "<entry - stop_distance>",
+    "target": "<entry + stop_distance * rewardRiskMult>",
+    "optLots": "<approx option lots to buy, delta-based — only present when showOptGuidance is on>",
+    "optNote": "approx, delta-based, verify live premium before sizing"
+  },
+
+  "example_sell_alert": {
+    "action": "sell",
+    "symbol": "{{ticker}}",
+    "price": "{{close}}",
+    "stop": "<entry + stop_distance>",
+    "target": "<entry - stop_distance * rewardRiskMult>",
+    "optLots": "<approx option lots to buy (PE side), delta-based — only present when showOptGuidance is on>",
+    "optNote": "approx, delta-based, verify live premium before sizing"
+  },
+
+  "_optLots_caveat": "optLots is NOT a real premium calculation — it's riskCapital / (underlying_stop_distance * optDelta * optLotSize), an approximation using a fixed assumed delta (default 0.5, ATM-ish). Real option delta moves with moneyness, time to expiry and IV, and the script has no live option chain data. Treat optLots as a rough starting point and re-check against the actual live premium/delta of the strike you intend to trade before sizing a real order. See options-trading-notes.md.",
+
+  "relay_responsibilities": [
+    "Verify the webhook request actually came from TradingView (e.g. shared secret in the URL or a header check) before acting on it.",
+    "Reject/deduplicate repeated alerts for the same bar/signal.",
+    "Convert 'action' + 'price'/'stop'/'target' into an actual bracket order via your broker's API (for options: pick the strike/expiry per options-trading-notes.md, and size using your own live premium — optLots is a starting estimate, not a live calculation).",
+    "Enforce your own max daily loss / max open positions independent of the strategy.",
+    "Log every received alert and resulting order for reconciliation against the TradingView backtest/paper results."
+  ]
+}
