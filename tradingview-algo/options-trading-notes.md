@@ -43,13 +43,31 @@ trading.
    held for hours (futures P&L tracks the underlying signal directly, no
    theta/IV distortion) — options make more sense for short, high-conviction
    moves where you're comfortable with the extra decay risk.
-4. **Size by premium risk, not underlying risk.** The strategy's position
-   sizing (`riskPerTradePct` ÷ stop distance) is computed in underlying
-   points. If you convert a signal into an option trade, size the number of
-   lots so that (stop-loss premium level − entry premium) × lot size ×
-   quantity stays within the same rupee risk, not just because "1 lot"
-   sounds small — options risk is on the premium, not the underlying's
-   move.
+4. **Size by premium risk, not underlying risk.** The strategy's core
+   position sizing (`riskPerTradePct` ÷ stop distance) is computed in
+   underlying points and is meaningless as a literal lot count for
+   options — it's only correct for a futures/underlying-equivalent trade.
+
+   `strategy.pine` v2.3+ adds a separate, clearly-labeled **options sizing
+   guidance** block (`showOptGuidance` input) that approximates this for
+   you: `optLots = riskCapital / (underlying_stop_distance × optDelta ×
+   optLotSize)`, shown on the dashboard and included as `optLots` in the
+   alert JSON (see `alert-webhook-template.json`). This is *not* a real
+   premium model — `optDelta` is a fixed assumption (default 0.5, roughly
+   ATM) you set yourself, and real delta moves with moneyness, time to
+   expiry and IV. It also does **not** change the backtest P&L shown by
+   Strategy Tester, which is still computed on the underlying — Pine can
+   only simulate trades on the chart's own symbol. Treat `optLots` as a
+   starting point: re-check it against the live premium and delta of the
+   actual strike you're about to trade before sizing a real order.
+
+   This matters most for smaller accounts: on NIFTY futures-equivalent
+   sizing, 1% risk on a ₹1-5 lakh account very plausibly rounds down to
+   **zero contracts** most of the time (futures notional/margin per lot is
+   large relative to that capital) — the strategy would show valid
+   signals but the underlying-sized backtest trade never fires. Options
+   buying fits that capital size far better, which is exactly why the
+   `optLots` guidance exists.
 5. **Respect lot sizes and exchange-mandated freeze quantities** (NSE caps
    the max order size per single order for index options — split larger
    orders if needed).

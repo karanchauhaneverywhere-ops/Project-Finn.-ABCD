@@ -43,6 +43,17 @@
 // and quantity is now floored to whole contracts with entries skipped
 // (not fired at a broken size) when that rounds to zero.
 //
+// v2.3 — options sizing guidance, added after confirming this is being
+// run on the NIFTY spot/index chart with ~Rs 1-5L capital: at that size,
+// NIFTY futures-equivalent position sizing (1% risk) very plausibly
+// floors to 0 contracts most of the time (futures notional/margin per
+// lot is large relative to that capital), while NIFTY OPTIONS (buying)
+// fit the capital far better. Added a delta-approximated option lot
+// count (dashboard + alert "optLots" field) alongside the existing
+// underlying-based sizing — it does NOT change the backtest P&L above
+// (Pine can only simulate trades on the chart's own symbol), it's
+// guidance for sizing the real option order. See options-trading-notes.md.
+//
 // This still does not target or guarantee any fixed win rate — see
 // tradingview-algo/README.md for why, and tradingview-algo/BACKTESTING_GUIDE.md
 // for how to validate this on real NSE data before risking capital.
@@ -111,6 +122,11 @@ useTrailStop     = input.bool(true, "ATR trailing stop once active", group = grp
 trailActivateRMult = input.float(1.15, "Only start trailing after this many R (must stay below the Take Profit multiple above, else the trail never gets a chance to act before the target fills)", minval = 1.0, group = grp_risk)
 trailAtrMult     = input.float(2.0, "Trailing stop = ATR x (wider = less likely to clip normal noise)", group = grp_risk)
 maxBarsInTrade   = input.int(150, "Max bars in trade (0 = off)", group = grp_risk)
+
+grp_opt = "Options Sizing Guidance (approximate — does NOT change the backtest P&L above, which is computed on the underlying)"
+showOptGuidance = input.bool(true, "Show suggested option-buying lot count (dashboard + alerts)", group = grp_opt)
+optDelta   = input.float(0.5, "Estimated ATM option delta (0.4-0.6 typical) — how much premium moves per underlying point", minval = 0.05, maxval = 1.0, group = grp_opt)
+optLotSize = input.int(75, "Lot size — VERIFY your broker's current NSE lot size before trusting this, it changes periodically", minval = 1, group = grp_opt)
 
 grp_circuit = "Daily Circuit Breaker (critical for options/index day-trading)"
 maxTradesPerDay = input.int(4, "Max trades per session (0 = off)", group = grp_circuit)
@@ -247,6 +263,21 @@ longQty     = longStopDistance  > 0 ? math.floor(riskCapital / (longStopDistance
 shortQty    = shortStopDistance > 0 ? math.floor(riskCapital / (shortStopDistance * syminfo.pointvalue)) : 0.0
 
 // ---------------------------------------------------------------------------
+// OPTIONS SIZING GUIDANCE — approximates option-buying lot count from the
+// same riskCapital/stop-distance used above, translated through an
+// assumed delta (premium risk ~= underlying stop distance x delta). This
+// is a rough starting point, not a real premium model — delta itself
+// moves with moneyness, time to expiry and IV, so cross-check against the
+// live option chain before sizing a real order. It does not feed into
+// strategy.entry/the backtest above; it's guidance only (see
+// options-trading-notes.md).
+// ---------------------------------------------------------------------------
+longOptPremiumRisk  = longStopDistance  * optDelta
+shortOptPremiumRisk = shortStopDistance * optDelta
+longOptLots  = longOptPremiumRisk  > 0 ? math.floor(riskCapital / (longOptPremiumRisk  * optLotSize)) : 0.0
+shortOptLots = shortOptPremiumRisk > 0 ? math.floor(riskCapital / (shortOptPremiumRisk * optLotSize)) : 0.0
+
+// ---------------------------------------------------------------------------
 // ORDERS
 // ---------------------------------------------------------------------------
 var float longStopPrice  = na
@@ -257,19 +288,26 @@ var float longRDist      = na
 var float shortRDist     = na
 var int   entryBarIndex  = na
 
-if freshLong and canTrade and longQty > 0
+// Levels are computed whenever a signal qualifies, independent of whether
+// the underlying-sized backtest trade itself fires (longQty can floor to
+// 0 on a small account trading NIFTY futures-equivalent size while the
+// options lot guidance below is still valid) — otherwise the alert below
+// would carry stale levels from a previous trade whenever longQty is 0.
+if freshLong and canTrade
     longStopPrice := close - longStopDistance
     longTPPrice   := close + longStopDistance * rewardRiskMult
     longRDist     := longStopDistance
-    strategy.entry("Long", strategy.long, qty = longQty)
-    entryBarIndex := bar_index
+    if longQty > 0
+        strategy.entry("Long", strategy.long, qty = longQty)
+        entryBarIndex := bar_index
 
-if freshShort and canTrade and shortQty > 0
+if freshShort and canTrade
     shortStopPrice := close + shortStopDistance
     shortTPPrice   := close - shortStopDistance * rewardRiskMult
     shortRDist      := shortStopDistance
-    strategy.entry("Short", strategy.short, qty = shortQty)
-    entryBarIndex := bar_index
+    if shortQty > 0
+        strategy.entry("Short", strategy.short, qty = shortQty)
+        entryBarIndex := bar_index
 
 if strategy.position_size > 0
     gain = close - strategy.position_avg_price
@@ -295,13 +333,22 @@ if inEodWindow and strategy.position_size != 0
     strategy.close_all(comment = "Session close")
 
 // ---------------------------------------------------------------------------
-// ALERTS — for webhook automation (see alert-webhook-template.json)
+// ALERTS — for webhook automation (see alert-webhook-template.json). Fires
+// if EITHER the underlying-sized backtest trade is viable OR the options
+// lot guidance is viable — not just the former, since your real execution
+// may be entirely via options while the underlying-equivalent size floors
+// to zero on a smaller account.
 // ---------------------------------------------------------------------------
-if freshLong and canTrade and longQty > 0
-    alert('{"action":"buy","symbol":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"stop":' + str.tostring(longStopPrice) + ',"target":' + str.tostring(longTPPrice) + '}', alert.freq_once_per_bar_close)
+longTradeable  = longQty  > 0 or (showOptGuidance and longOptLots  > 0)
+shortTradeable = shortQty > 0 or (showOptGuidance and shortOptLots > 0)
 
-if freshShort and canTrade and shortQty > 0
-    alert('{"action":"sell","symbol":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"stop":' + str.tostring(shortStopPrice) + ',"target":' + str.tostring(shortTPPrice) + '}', alert.freq_once_per_bar_close)
+if freshLong and canTrade and longTradeable
+    optFieldLong = showOptGuidance ? ',"optLots":' + str.tostring(longOptLots) + ',"optNote":"approx, delta-based, verify live premium before sizing"' : ''
+    alert('{"action":"buy","symbol":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"stop":' + str.tostring(longStopPrice) + ',"target":' + str.tostring(longTPPrice) + optFieldLong + '}', alert.freq_once_per_bar_close)
+
+if freshShort and canTrade and shortTradeable
+    optFieldShort = showOptGuidance ? ',"optLots":' + str.tostring(shortOptLots) + ',"optNote":"approx, delta-based, verify live premium before sizing"' : ''
+    alert('{"action":"sell","symbol":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"stop":' + str.tostring(shortStopPrice) + ',"target":' + str.tostring(shortTPPrice) + optFieldShort + '}', alert.freq_once_per_bar_close)
 
 // ---------------------------------------------------------------------------
 // PLOTS
@@ -320,7 +367,7 @@ bgcolor(circuitTripped ? color.new(color.red, 85) : na, title = "Daily circuit b
 // ---------------------------------------------------------------------------
 // DASHBOARD
 // ---------------------------------------------------------------------------
-var table dash = table.new(position.top_right, 2, 6, border_width = 1)
+var table dash = table.new(position.top_right, 2, showOptGuidance ? 8 : 6, border_width = 1)
 if barstate.islast
     table.cell(dash, 0, 0, "Long score",  bgcolor = color.new(color.green, 85))
     table.cell(dash, 1, 0, str.tostring(longScore) + "/5")
@@ -334,3 +381,8 @@ if barstate.islast
     table.cell(dash, 1, 4, str.tostring(lossesToday) + " / " + str.tostring(maxLossesPerDay))
     table.cell(dash, 0, 5, "Circuit breaker", bgcolor = circuitTripped ? color.new(color.red, 70) : color.new(color.green, 85))
     table.cell(dash, 1, 5, circuitTripped ? "TRIPPED" : "OK")
+    if showOptGuidance
+        table.cell(dash, 0, 6, "Est. CE lots (approx)")
+        table.cell(dash, 1, 6, str.tostring(longOptLots))
+        table.cell(dash, 0, 7, "Est. PE lots (approx)")
+        table.cell(dash, 1, 7, str.tostring(shortOptLots))
