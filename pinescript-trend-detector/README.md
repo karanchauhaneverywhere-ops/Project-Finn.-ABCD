@@ -85,6 +85,37 @@ window and thresholds, pivot lookback, MA lengths/type, and the score
 thresholds that separate "Trend" from "Strong Trend") are exposed as inputs
 so the classifier can be tuned per instrument and timeframe.
 
+### The trade overlay — read this before trading from the chart
+
+**The shaded background is a state, not a signal, and the two are not
+interchangeable.** The strategy enters on the single bar a trend first
+qualifies; the background stays lit for every bar the state holds, which may
+be dozens. Buying because the chart is green means entering the same trend
+much later than the strategy did, at a worse price, with no stop — a
+materially different trade from the one that gets backtested.
+
+So the indicator also draws the strategy's actual trade lifecycle
+(`Trade Overlay` input group, on by default):
+
+- **`LONG` / `SHORT` labels** mark the exact bar the strategy enters — the
+  rising edge, not the ongoing state.
+- **A red chandelier stop line** tracks the live protective stop, ratcheting
+  in the trade's favor and never loosening. This is where most losing trades
+  actually end.
+- **`✕` marks a stop exit; `▫` marks a score exit** — the two distinct ways
+  the strategy closes a position.
+- **The table** reports the simulated position ("Long from 1.2345") and the
+  active stop price.
+- **Four `TRADE:` alert conditions** fire on entries and exits. If you want
+  alerts that correspond to trades, use those — the four trend-state alerts
+  describe market conditions, not trade instructions.
+
+The overlay mirrors the strategy's fill model (entries and score exits at the
+bar close, the stop live intrabar at the level set on the prior close). It is
+a visual reconstruction rather than a bit-exact replay of TradingView's broker
+emulator, and it models no commission or slippage — so expect small
+differences against the Strategy Tester's trade list.
+
 ## Using the strategy
 
 `strategies/Deterministic_Trend_Strategy.pine` reuses the identical
@@ -126,7 +157,10 @@ broker before drawing any conclusions from the results.
 
 - The swing-structure component can only confirm a pivot `pivotRight` bars
   after it forms — a bounded, disclosed lag, not repainting of already-set
-  values.
+  values. Note that the pivot triangles are drawn *at* the pivot bar, so on
+  historical charts they look like perfectly-timed swing calls; nothing was on
+  screen at that moment, and reading them as live turning-point signals will
+  badly overstate what the tool can do.
 - Every component looks backward over a finite window; nothing in this
   toolkit predicts future price. A trend *label* describes price geometry
   that has already happened, up to the confirmation lag above.

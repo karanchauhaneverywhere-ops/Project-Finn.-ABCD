@@ -37,6 +37,24 @@
 //      "perfectly trending" end of the CHOP scale — a degenerate flat window
 //      therefore reported maximum trendiness. It now returns na.
 //
+// v3 adds a TRADE OVERLAY, because the shaded background is a *state*, not a
+// *signal*, and the two are not interchangeable. The companion strategy enters
+// on the one bar a trend first qualifies (a rising edge) and protects the
+// position with a ratcheting ATR stop; the background, by contrast, stays lit
+// for every bar the state holds. Reading an entry off the colour therefore
+// buys the same trend many bars later, at a worse price, with no stop — a
+// materially different trade from the one the strategy backtests.
+//
+// The overlay simulates the strategy's trade lifecycle bar by bar and draws
+// it: entry markers on the qualifying edge, the chandelier stop as a visible
+// ratcheting line, and exit markers for both ways a position can end (stop
+// hit, or score exit). What you see is then what the strategy does.
+//
+// The simulation mirrors the strategy's fill model — entries and score exits
+// at the bar close, the stop live intrabar at the level set on the prior
+// close — but it is a visual reconstruction, not a bit-exact replay of
+// TradingView's broker emulator, and it models no commission or slippage.
+//
 // This script is for research/education. It is not financial advice.
 // =============================================================================
 indicator("Deterministic Trend Detector [Finn]", shorttitle = "DTD", overlay = true)
@@ -77,10 +95,24 @@ weakThresh    = input.int(2, "Score >= this => Trend (entry threshold)", minval 
 exitThresh    = input.int(0, "Leave a trend state when score crosses this (must be < weakThresh — the gap is the hysteresis dead zone)", minval = -4, maxval = 4, group = grpScore)
 confirmOnClose = input.bool(true, "Only update the state on closed bars (prevents intrabar signal flicker)", group = grpScore)
 
+grpTrade = "Trade Overlay (mirrors the strategy script)"
+showTrades  = input.bool(true, "Mark the strategy's entries, exits and stop", group = grpTrade)
+allowLong   = input.bool(true, "Mark long entries", group = grpTrade)
+allowShort  = input.bool(true, "Mark short entries", group = grpTrade)
+atrStopMult = input.float(2.5, "Initial risk & chandelier trail, in ATRs", minval = 0.5, step = 0.5, group = grpTrade)
+
+grpHtf = "Higher-Timeframe Filter (optional, off by default)"
+useHtfFilter = input.bool(false, "Require higher-timeframe trend alignment", group = grpHtf)
+htfRes       = input.timeframe("D", "Higher timeframe", group = grpHtf)
+htfMaLen     = input.int(50, "Higher-timeframe EMA length", minval = 1, group = grpHtf)
+
 grpDisp = "Display"
 showTable  = input.bool(true, "Show breakdown table", group = grpDisp)
 showBg     = input.bool(true, "Shade background by trend", group = grpDisp)
-showPivots = input.bool(true, "Mark confirmed swing pivots", group = grpDisp)
+// The pivot markers are drawn at the pivot bar but only exist once `pivotRight`
+// later bars have closed. Scrolling history they look like perfect swing calls;
+// nothing was on screen at that moment. The label says so to keep it honest.
+showPivots = input.bool(true, "Mark swing pivots (drawn at the pivot, confirmed only N bars later)", group = grpDisp)
 
 // -----------------------------------------------------------------------------
 // 1. Least-squares regression: ATR-normalized slope + R^2 (linearity)
@@ -231,6 +263,87 @@ var int barsInState = 0
 barsInState := (trendState == trendState[1]) ? barsInState + 1 : 0
 
 // -----------------------------------------------------------------------------
+// Trade overlay — reconstructs what the strategy script actually trades
+// -----------------------------------------------------------------------------
+// The background shading answers "what state is the market in?". These signals
+// answer "what would the strategy have done?", which is the question you need
+// answered before taking a trade. They are not the same: the state is true for
+// a whole run of bars, the entry is true for exactly one.
+htfMA = request.security(syminfo.tickerid, htfRes, ta.ema(close, htfMaLen), lookahead = barmerge.lookahead_off)
+htfAllowsLong  = not useHtfFilter or close > htfMA
+htfAllowsShort = not useHtfFilter or close < htfMA
+
+longQualifies  = allowLong  and htfAllowsLong  and not chopBlocksEntry and rawScore >= weakThresh
+shortQualifies = allowShort and htfAllowsShort and not chopBlocksEntry and rawScore <= -weakThresh
+
+// The rising edge is the entry. Identical to the strategy's longCondition.
+longEntrySignal  = longQualifies  and not longQualifies[1]
+shortEntrySignal = shortQualifies and not shortQualifies[1]
+
+var int   simPos         = 0        // 0 flat, +1 long, -1 short
+var float simEntry       = na
+var float longStopLevel  = na
+var float shortStopLevel = na
+
+bool wentLong       = false
+bool wentShort      = false
+bool stopHit        = false
+bool scoreExit      = false
+float exitMarkPrice = na
+
+// 1. The stop set on the previous close is live during this bar and fills
+//    intrabar, exactly as the strategy's stop order does. `high`/`low` only
+//    widen as a bar forms, so this test cannot flicker back off once true.
+if simPos == 1 and not na(longStopLevel) and low <= longStopLevel
+    stopHit := true
+    exitMarkPrice := longStopLevel
+    simPos := 0
+    simEntry := na
+else if simPos == -1 and not na(shortStopLevel) and high >= shortStopLevel
+    stopHit := true
+    exitMarkPrice := shortStopLevel
+    simPos := 0
+    simEntry := na
+
+// 2-4. Score exits, entries and the trail ratchet all key off `rawScore`,
+//      which moves while a bar is forming, so they wait for the close — both
+//      to match the strategy's fill model and to stop markers appearing
+//      mid-bar and then vanishing.
+if mayUpdate
+    if simPos == 1 and rawScore <= exitThresh
+        scoreExit := true
+        exitMarkPrice := close
+        simPos := 0
+        simEntry := na
+    else if simPos == -1 and rawScore >= -exitThresh
+        scoreExit := true
+        exitMarkPrice := close
+        simPos := 0
+        simEntry := na
+
+    // Entries fill at the close. A signal while already in that direction is
+    // ignored, matching the strategy's pyramiding-free behaviour; a signal
+    // against an open position reverses it, as strategy.entry() does.
+    if longEntrySignal and simPos <= 0
+        wentLong := true
+        simPos := 1
+        simEntry := close
+        longStopLevel := high - atrStopMult * atrVal
+    else if shortEntrySignal and simPos >= 0
+        wentShort := true
+        simPos := -1
+        simEntry := close
+        shortStopLevel := low + atrStopMult * atrVal
+
+    // Ratchet the trail for the next bar — never loosens.
+    if simPos == 1 and not wentLong
+        longStopLevel := math.max(longStopLevel, high - atrStopMult * atrVal)
+    if simPos == -1 and not wentShort
+        shortStopLevel := math.min(shortStopLevel, low + atrStopMult * atrVal)
+
+activeStop = simPos == 1 ? longStopLevel : (simPos == -1 ? shortStopLevel : na)
+
+// -----------------------------------------------------------------------------
 // Visuals
 // -----------------------------------------------------------------------------
 plot(regNow, "Regression line", color = color.new(color.aqua, 0), linewidth = 2)
@@ -249,6 +362,15 @@ bgcolor(showBg ? bgColor : na)
 plotshape(showPivots and not na(pivHigh) ? pivHigh : na, title = "Pivot High", style = shape.triangledown, location = location.abovebar, color = color.red, offset = -pivotRight, size = size.tiny)
 plotshape(showPivots and not na(pivLow) ? pivLow : na, title = "Pivot Low", style = shape.triangleup, location = location.belowbar, color = color.green, offset = -pivotRight, size = size.tiny)
 
+// --- Trade overlay: the actual entry/exit moments, and the live stop --------
+plot(showTrades and simPos == 1 ? longStopLevel : na, title = "Chandelier stop (long)", color = color.new(color.red, 0), style = plot.style_linebr, linewidth = 2)
+plot(showTrades and simPos == -1 ? shortStopLevel : na, title = "Chandelier stop (short)", color = color.new(color.red, 0), style = plot.style_linebr, linewidth = 2)
+
+plotshape(showTrades and wentLong ? low : na, title = "Strategy LONG entry", style = shape.labelup, location = location.belowbar, color = color.new(color.lime, 0), textcolor = color.black, text = "LONG", size = size.small)
+plotshape(showTrades and wentShort ? high : na, title = "Strategy SHORT entry", style = shape.labeldown, location = location.abovebar, color = color.new(color.red, 0), textcolor = color.white, text = "SHORT", size = size.small)
+plotshape(showTrades and stopHit ? exitMarkPrice : na, title = "Stop hit", style = shape.xcross, location = location.absolute, color = color.new(color.orange, 0), size = size.small)
+plotshape(showTrades and scoreExit ? exitMarkPrice : na, title = "Score exit", style = shape.square, location = location.absolute, color = color.new(color.silver, 0), size = size.tiny)
+
 // Numeric detail kept out of the visible chart, available in the Data Window
 plot(rawScore, "Composite score", display = display.data_window)
 plot(strengthPct, "Trend strength %", display = display.data_window)
@@ -260,7 +382,7 @@ plot(normSlope, "Regression slope (ATRs/bar)", display = display.data_window)
 // -----------------------------------------------------------------------------
 // Breakdown table
 // -----------------------------------------------------------------------------
-var table infoTable = table.new(position.top_right, 2, 11, border_width = 1)
+var table infoTable = table.new(position.top_right, 2, 13, border_width = 1)
 
 f_cell(t, row, label, value, valColor) =>
     table.cell(t, 0, row, label, text_color = color.white, bgcolor = color.new(color.black, 30), text_size = size.small)
@@ -280,6 +402,11 @@ if showTable and barstate.islast
     f_cell(infoTable, 8, "New entries", chopBlocksEntry ? "Blocked (choppy)" : "Clear", chopBlocksEntry ? color.orange : color.lime)
     f_cell(infoTable, 9, "MA stack", voteStack == 1 ? "Bullish" : (voteStack == -1 ? "Bearish" : "Mixed"), color.white)
     f_cell(infoTable, 10, "Swing structure", structureLabel, color.white)
+    posText = simPos == 1 ? "Long from " + str.tostring(simEntry, format.mintick) :
+         simPos == -1 ? "Short from " + str.tostring(simEntry, format.mintick) : "Flat"
+    posColor = simPos == 1 ? color.lime : (simPos == -1 ? color.red : color.silver)
+    f_cell(infoTable, 11, "Strategy position", posText, posColor)
+    f_cell(infoTable, 12, "Active stop", na(activeStop) ? "—" : str.tostring(activeStop, format.mintick), na(activeStop) ? color.silver : color.orange)
 
 // -----------------------------------------------------------------------------
 // Alerts
@@ -301,3 +428,10 @@ alertcondition(enteredUp, title = "Entered Uptrend", message = "Deterministic Tr
 alertcondition(enteredDown, title = "Entered Downtrend", message = "Deterministic Trend Detector: {{ticker}} entered a DOWNTREND on {{interval}}")
 alertcondition(enteredFlat, title = "Entered Sideways", message = "Deterministic Trend Detector: {{ticker}} entered SIDEWAYS/RANGE on {{interval}}")
 alertcondition(trendChanged, title = "Trend state changed (incl. strength)", message = "Deterministic Trend Detector: {{ticker}} trend state changed on {{interval}}")
+
+// Trade-level alerts. These are the ones to act on: the four above describe
+// what the market is doing, these four describe what the strategy would do.
+alertcondition(wentLong, title = "TRADE: long entry", message = "Deterministic Trend Detector: LONG entry on {{ticker}} {{interval}} at {{close}}")
+alertcondition(wentShort, title = "TRADE: short entry", message = "Deterministic Trend Detector: SHORT entry on {{ticker}} {{interval}} at {{close}}")
+alertcondition(stopHit, title = "TRADE: stop hit", message = "Deterministic Trend Detector: trailing stop hit on {{ticker}} {{interval}}")
+alertcondition(scoreExit, title = "TRADE: score exit", message = "Deterministic Trend Detector: score exit on {{ticker}} {{interval}} at {{close}}")
