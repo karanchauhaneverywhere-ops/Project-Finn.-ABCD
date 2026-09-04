@@ -1,0 +1,27 @@
+{
+  "_comment": "This is the JSON payload shape emitted by strategy.pine's alert() calls. Point a TradingView webhook alert at your relay/bot endpoint; the relay is responsible for translating this into a real broker order plus its own risk controls (duplicate-alert guard, daily loss limit, kill switch).",
+
+  "example_buy_alert": {
+    "action": "buy",
+    "symbol": "{{ticker}}",
+    "price": "{{close}}",
+    "stop": "<entry - ATR * atrStopMult>",
+    "target": "<entry + stop_distance * rewardRiskMult>"
+  },
+
+  "example_sell_alert": {
+    "action": "sell",
+    "symbol": "{{ticker}}",
+    "price": "{{close}}",
+    "stop": "<entry + ATR * atrStopMult>",
+    "target": "<entry - stop_distance * rewardRiskMult>"
+  },
+
+  "relay_responsibilities": [
+    "Verify the webhook request actually came from TradingView (e.g. shared secret in the URL or a header check) before acting on it.",
+    "Reject/deduplicate repeated alerts for the same bar/signal.",
+    "Convert 'action' + 'price'/'stop'/'target' into an actual bracket order via your broker's API.",
+    "Enforce your own max daily loss / max open positions independent of the strategy.",
+    "Log every received alert and resulting order for reconciliation against the TradingView backtest/paper results."
+  ]
+}

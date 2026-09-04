@@ -1,0 +1,172 @@
+//@version=5
+// =============================================================================
+// Confluence Trend Strategy (CTS)
+// -----------------------------------------------------------------------------
+// A rules-based, risk-managed strategy that only fires when multiple
+// independent signals agree: higher-timeframe trend, momentum, volatility
+// expansion and volume. Every rule is visible and adjustable — there is no
+// "black box" and no promised win rate. Backtest it yourself (see
+// tradingview-algo/BACKTESTING_GUIDE.md) before risking real capital.
+// =============================================================================
+strategy(
+     title              = "Confluence Trend Strategy (CTS)",
+     shorttitle         = "CTS",
+     overlay            = true,
+     initial_capital    = 10000,
+     default_qty_type   = strategy.percent_of_equity,
+     default_qty_value  = 100,
+     pyramiding         = 0,
+     commission_type    = strategy.commission.percent,
+     commission_value   = 0.05,
+     slippage           = 2,
+     calc_on_every_tick = false,
+     process_orders_on_close = true)
+
+// ---------------------------------------------------------------------------
+// INPUTS
+// ---------------------------------------------------------------------------
+grp_trend = "Trend Filter"
+htfRes      = input.timeframe("240", "Higher timeframe (trend filter)", group = grp_trend)
+emaFastLen  = input.int(21,  "EMA Fast", group = grp_trend)
+emaSlowLen  = input.int(50,  "EMA Slow", group = grp_trend)
+emaTrendLen = input.int(200, "EMA Trend (macro filter)", group = grp_trend)
+
+grp_mom = "Momentum"
+rsiLen      = input.int(14, "RSI Length", group = grp_mom)
+rsiLongMin  = input.int(50, "RSI must be >= this for longs", group = grp_mom)
+rsiShortMax = input.int(50, "RSI must be <= this for shorts", group = grp_mom)
+macdFast    = input.int(12, "MACD Fast", group = grp_mom)
+macdSlow    = input.int(26, "MACD Slow", group = grp_mom)
+macdSignal  = input.int(9,  "MACD Signal", group = grp_mom)
+
+grp_vol = "Volatility / Volume Filters"
+atrLen        = input.int(14, "ATR Length", group = grp_vol)
+volAvgLen     = input.int(20, "Volume SMA Length", group = grp_vol)
+minVolRatio   = input.float(1.0, "Min volume vs its average (x)", step = 0.1, group = grp_vol)
+useChopFilter = input.bool(true, "Filter out chop (ADX)", group = grp_vol)
+adxLen        = input.int(14, "ADX Length", group = grp_vol)
+adxMin        = input.float(20, "Minimum ADX to trade", group = grp_vol)
+
+grp_risk = "Risk Management"
+riskPerTradePct = input.float(1.0, "Risk per trade (% of equity)", minval = 0.1, maxval = 10, group = grp_risk)
+atrStopMult     = input.float(1.5, "Stop Loss = ATR x", group = grp_risk)
+rewardRiskMult  = input.float(2.0, "Take Profit = Stop distance x", group = grp_risk)
+useTrailStop    = input.bool(true, "Use ATR trailing stop after 1R", group = grp_risk)
+trailAtrMult    = input.float(1.5, "Trailing stop = ATR x", group = grp_risk)
+maxBarsInTrade  = input.int(200, "Max bars in trade (0 = off)", group = grp_risk)
+
+grp_session = "Session Filter (optional)"
+useSession  = input.bool(false, "Restrict entries to session", group = grp_session)
+sessionStr  = input.session("0930-1600", "Session (exchange time)", group = grp_session)
+
+grp_dir = "Direction"
+allowLongs  = input.bool(true,  "Allow Long trades", group = grp_dir)
+allowShorts = input.bool(true,  "Allow Short trades", group = grp_dir)
+
+// ---------------------------------------------------------------------------
+// INDICATORS
+// ---------------------------------------------------------------------------
+emaFast  = ta.ema(close, emaFastLen)
+emaSlow  = ta.ema(close, emaSlowLen)
+emaTrend = ta.ema(close, emaTrendLen)
+
+// Higher-timeframe trend confirmation (avoids trading against the larger move)
+htfClose = request.security(syminfo.tickerid, htfRes, close, lookahead = barmerge.lookahead_off)
+htfEma   = request.security(syminfo.tickerid, htfRes, ta.ema(close, emaTrendLen), lookahead = barmerge.lookahead_off)
+htfUp    = htfClose > htfEma
+htfDown  = htfClose < htfEma
+
+[macdLine, signalLine, _] = ta.macd(close, macdFast, macdSlow, macdSignal)
+rsiVal = ta.rsi(close, rsiLen)
+
+atrVal = ta.atr(atrLen)
+volAvg = ta.sma(volume, volAvgLen)
+volOk  = volume >= volAvg * minVolRatio
+
+[diPlus, diMinus, adxVal] = ta.dmi(adxLen, adxLen)
+chopOk = not useChopFilter or adxVal >= adxMin
+
+inSession = not useSession or not na(time(timeframe.period, sessionStr))
+
+// ---------------------------------------------------------------------------
+// ENTRY LOGIC — every condition below must agree (confluence)
+// ---------------------------------------------------------------------------
+longTrend  = emaFast > emaSlow and close > emaTrend and htfUp
+shortTrend = emaFast < emaSlow and close < emaTrend and htfDown
+
+longMomentum  = macdLine > signalLine and rsiVal >= rsiLongMin and rsiVal < 80
+shortMomentum = macdLine < signalLine and rsiVal <= rsiShortMax and rsiVal > 20
+
+longSignal  = allowLongs  and longTrend  and longMomentum  and volOk and chopOk and inSession
+shortSignal = allowShorts and shortTrend and shortMomentum and volOk and chopOk and inSession
+
+// One fresh signal per crossover only (avoid re-triggering every bar in trend)
+freshLong  = longSignal  and not longSignal[1]
+freshShort = shortSignal and not shortSignal[1]
+
+// ---------------------------------------------------------------------------
+// POSITION SIZING — risk a fixed % of equity per trade based on stop distance
+// ---------------------------------------------------------------------------
+stopDistance = atrVal * atrStopMult
+riskCapital  = strategy.equity * (riskPerTradePct / 100)
+qty          = stopDistance > 0 ? riskCapital / stopDistance : 0.0
+
+// ---------------------------------------------------------------------------
+// ORDERS
+// ---------------------------------------------------------------------------
+var float longStopPrice  = na
+var float longTPPrice    = na
+var float shortStopPrice = na
+var float shortTPPrice   = na
+var int   entryBarIndex  = na
+
+if freshLong and strategy.position_size == 0
+    longStopPrice := close - stopDistance
+    longTPPrice   := close + stopDistance * rewardRiskMult
+    strategy.entry("Long", strategy.long, qty = qty)
+    entryBarIndex := bar_index
+
+if freshShort and strategy.position_size == 0
+    shortStopPrice := close + stopDistance
+    shortTPPrice   := close - stopDistance * rewardRiskMult
+    strategy.entry("Short", strategy.short, qty = qty)
+    entryBarIndex := bar_index
+
+// Exit orders (fixed stop / target, optional trailing stop after +1R)
+if strategy.position_size > 0
+    trailPrice = useTrailStop and (close - strategy.position_avg_price >= stopDistance) ?
+         math.max(longStopPrice, close - atrVal * trailAtrMult) : longStopPrice
+    longStopPrice := trailPrice
+    strategy.exit("Long Exit", from_entry = "Long", stop = longStopPrice, limit = longTPPrice)
+
+if strategy.position_size < 0
+    trailPrice = useTrailStop and (strategy.position_avg_price - close >= stopDistance) ?
+         math.min(shortStopPrice, close + atrVal * trailAtrMult) : shortStopPrice
+    shortStopPrice := trailPrice
+    strategy.exit("Short Exit", from_entry = "Short", stop = shortStopPrice, limit = shortTPPrice)
+
+// Time-based stop: exit if a trade overstays its welcome (avoids dead capital)
+if maxBarsInTrade > 0 and strategy.position_size != 0 and not na(entryBarIndex)
+    if bar_index - entryBarIndex >= maxBarsInTrade
+        strategy.close_all(comment = "Max bars reached")
+
+// ---------------------------------------------------------------------------
+// ALERTS — for webhook automation to a broker/bot (see alert-webhook-template.json)
+// ---------------------------------------------------------------------------
+if freshLong and strategy.position_size == 0
+    alert('{"action":"buy","symbol":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"stop":' + str.tostring(longStopPrice) + ',"target":' + str.tostring(longTPPrice) + '}', alert.freq_once_per_bar_close)
+
+if freshShort and strategy.position_size == 0
+    alert('{"action":"sell","symbol":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"stop":' + str.tostring(shortStopPrice) + ',"target":' + str.tostring(shortTPPrice) + '}', alert.freq_once_per_bar_close)
+
+// ---------------------------------------------------------------------------
+// PLOTS
+// ---------------------------------------------------------------------------
+plot(emaFast,  "EMA Fast",  color = color.new(color.aqua, 0))
+plot(emaSlow,  "EMA Slow",  color = color.new(color.orange, 0))
+plot(emaTrend, "EMA Trend", color = color.new(color.gray, 0), linewidth = 2)
+
+plotshape(freshLong,  title = "Long Signal",  style = shape.triangleup,   location = location.belowbar, color = color.new(color.green, 0), size = size.small)
+plotshape(freshShort, title = "Short Signal", style = shape.triangledown, location = location.abovebar, color = color.new(color.red, 0),   size = size.small)
+
+bgcolor(chopOk ? na : color.new(color.gray, 90), title = "Chop filter active")
