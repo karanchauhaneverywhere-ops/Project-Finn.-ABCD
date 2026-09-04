@@ -19,6 +19,18 @@
 //      an expiry-day/near-close cutoff, since this is built for Indian
 //      indices/stocks/options, not a generic 24/7 script.
 //
+// v2.1 — fix from a real backtest autopsy (20 trades, 25% win rate):
+// average win (₹393) was SMALLER than average loss (₹421) — a realized
+// reward:risk of ~0.93:1 against a designed 1.8:1. Cause, confirmed via
+// the trade log: winners were closing through the stop/target bracket
+// itself (not the EOD flatten), meaning the 1.2x-ATR trailing stop was
+// activating the instant a trade hit +1R and clipping it long before the
+// 1.8R target could fill. Fix: the target is lower (1.3R, more realistic
+// for one NSE session) and the trail no longer activates at the same
+// instant as breakeven — it now waits until trailActivateRMult (default
+// 1.15R) so the trade has room to reach target before the trail can
+// interfere, and is wider (2.0x ATR) so normal noise doesn't trigger it.
+//
 // This still does not target or guarantee any fixed win rate — see
 // tradingview-algo/README.md for why, and tradingview-algo/BACKTESTING_GUIDE.md
 // for how to validate this on real NSE data before risking capital.
@@ -81,10 +93,11 @@ grp_risk = "Risk Management"
 riskPerTradePct  = input.float(1.0, "Risk per trade (% of equity)", minval = 0.1, maxval = 10, group = grp_risk)
 swingLookback    = input.int(10, "Swing lookback for structure stop", group = grp_risk)
 atrStopFloorMult = input.float(1.0, "Minimum stop distance (x ATR floor)", group = grp_risk)
-rewardRiskMult   = input.float(1.8, "Take Profit = Stop distance x", group = grp_risk)
+rewardRiskMult   = input.float(1.3, "Take Profit = Stop distance x", group = grp_risk)
 useBreakeven     = input.bool(true, "Move stop to breakeven at +1R", group = grp_risk)
-useTrailStop     = input.bool(true, "ATR trailing stop after +1R", group = grp_risk)
-trailAtrMult     = input.float(1.2, "Trailing stop = ATR x", group = grp_risk)
+useTrailStop     = input.bool(true, "ATR trailing stop once active", group = grp_risk)
+trailActivateRMult = input.float(1.15, "Only start trailing after this many R (must stay below the Take Profit multiple above, else the trail never gets a chance to act before the target fills)", minval = 1.0, group = grp_risk)
+trailAtrMult     = input.float(2.0, "Trailing stop = ATR x (wider = less likely to clip normal noise)", group = grp_risk)
 maxBarsInTrade   = input.int(150, "Max bars in trade (0 = off)", group = grp_risk)
 
 grp_circuit = "Daily Circuit Breaker (critical for options/index day-trading)"
@@ -241,7 +254,7 @@ if strategy.position_size > 0
     gain = close - strategy.position_avg_price
     if useBreakeven and gain >= longRDist
         longStopPrice := math.max(longStopPrice, strategy.position_avg_price)
-    if useTrailStop and gain >= longRDist
+    if useTrailStop and gain >= longRDist * trailActivateRMult
         longStopPrice := math.max(longStopPrice, close - atrVal * trailAtrMult)
     strategy.exit("Long Exit", from_entry = "Long", stop = longStopPrice, limit = longTPPrice)
 
@@ -249,7 +262,7 @@ if strategy.position_size < 0
     gain = strategy.position_avg_price - close
     if useBreakeven and gain >= shortRDist
         shortStopPrice := math.min(shortStopPrice, strategy.position_avg_price)
-    if useTrailStop and gain >= shortRDist
+    if useTrailStop and gain >= shortRDist * trailActivateRMult
         shortStopPrice := math.min(shortStopPrice, close + atrVal * trailAtrMult)
     strategy.exit("Short Exit", from_entry = "Short", stop = shortStopPrice, limit = shortTPPrice)
 

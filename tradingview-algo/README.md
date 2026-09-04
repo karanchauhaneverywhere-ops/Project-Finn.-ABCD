@@ -41,6 +41,35 @@ numbers (win rate, profit factor, trade count, which instrument/timeframe)
 and I'll diagnose further — that's how this gets fixed for real, not by
 raising the promised number.
 
+## v2.1 — autopsy of a real 20-trade backtest (25% win rate)
+
+A real backtest (NIFTY/BANKNIFTY-type instrument, 15min-1H, underlying/
+futures, Strategy Tester) came back 5/20 profitable. The diagnosis, worked
+from the actual numbers instead of guesswork:
+
+- Average win ₹392.99 vs average loss ₹420.52 → **realized reward:risk was
+  ~0.93:1**, against a designed 1.8:1. That inversion, not the 25% win rate
+  itself, is what made profit factor only ~0.31.
+- Ruled out via data: not a long/short directional bug (wins and losses
+  were mixed across both directions) and not the end-of-day flatten
+  (winning trades exited through the normal stop/target bracket, not the
+  session-close rule).
+- Root cause: the ATR trailing stop and the breakeven move both triggered
+  at the same +1R mark, so the (too-tight, 1.2x ATR) trail started
+  choking winners the instant they went 1R in profit — well before they
+  could reach the 1.8R target.
+- Fix applied: target lowered to 1.3R (realistic for one NSE session
+  instead of rarely-hit 1.8R), and trailing now only activates once a
+  trade reaches `trailActivateRMult` (default 1.15R) — after breakeven,
+  before target — using a wider 2.0x ATR distance so it acts as a safety
+  net instead of the primary profit-taker.
+
+This was a targeted fix to the one thing the data implicated, not a
+re-tune of the entry logic (which the data showed was not the problem).
+Re-run the backtest on the same instrument/period and compare average
+win vs average loss again — that ratio, not the win rate alone, is the
+number that tells us whether this fix worked.
+
 ## What's in here
 
 | File | Purpose |
