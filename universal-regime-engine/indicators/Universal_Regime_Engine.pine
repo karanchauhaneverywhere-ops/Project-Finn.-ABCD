@@ -1,0 +1,649 @@
+//@version=6
+// =============================================================================
+//  FINN · ABCD  ▸  UNIVERSAL REGIME ENGINE   (FURE)
+// -----------------------------------------------------------------------------
+//  WHAT THIS IS
+//  ------------
+//  A market-agnostic, timeframe-agnostic *context engine*. It does not try to
+//  predict price. It measures seven independent, well-defined properties of the
+//  tape, converts each one into a bounded bias in [-1 .. +1], blends them into a
+//  single confluence score in [-100 .. +100], classifies the resulting market
+//  regime, and then applies the playbook that matches that regime.
+//
+//  WHY IT PORTS ACROSS EVERY MARKET AND EVERY TIMEFRAME
+//  ----------------------------------------------------
+//  Nothing in this script is measured in an instrument's own price units, so no
+//  threshold has to be re-tuned when you change symbol, currency or tick size:
+//
+//    * every DISTANCE is divided by ATR      -> "1.5 ATR" means the same thing on
+//                                               BTCUSD at 100,000 and EURUSD at 1.08
+//    * every STRENGTH reading is a bounded oscillator (RSI, MFI, ADX/DI, Kaufman
+//      efficiency ratio) -> already 0..100 or -1..+1 by construction
+//    * every VOLATILITY reading is a PERCENT RANK of the instrument's own recent
+//      history -> self-calibrating, no absolute volatility assumption
+//    * the higher-timeframe reference is DERIVED from the chart timeframe
+//      (chart x N) instead of being hard-coded, so the multi-timeframe logic
+//      keeps the same proportions on a 15-second chart and on a monthly chart
+//    * VOLUME is auto-detected. On instruments with no real volume (many FX
+//      feeds, indices, some CFDs) the volume factor is switched off and its
+//      weight is removed from the denominator, so the score stays on the same
+//      -100..+100 scale instead of being silently biased toward zero
+//
+//  Lengths stay in BARS on purpose. A 20-bar efficiency window is the same
+//  structural object on every timeframe; converting it to clock time would make
+//  the engine behave differently per timeframe, which is the opposite of the
+//  goal here.
+//
+//  THE SEVEN FACTORS  (each -> bias in [-1 .. +1], each independently weighted)
+//  ---------------------------------------------------------------------------
+//   1  TREND SLOPE    slope of a Kaufman adaptive MA over N bars, measured in
+//                     ATR. Adaptive because the efficiency ratio makes the MA
+//                     fast in clean trends and slow in chop -> less whipsaw.
+//   2  DISPLACEMENT   (price - adaptive MA) / ATR. Where price sits relative to
+//                     its own fair value, in volatility units.
+//   3  MOMENTUM       RSI re-centred: (RSI - 50) / 25, clamped.
+//   4  DIRECTIONAL    Wilder DI balance (+DI - -DI)/(+DI + -DI) scaled by ADX.
+//      STRENGTH       Direction and conviction are separated, then multiplied.
+//   5  STRUCTURE      Confirmed swing pivots -> Break of Structure / Change of
+//                     Character. Holds a +1/-1 state that decays with age, so a
+//                     30-bar-old break counts for less than a fresh one.
+//   6  VOLUME FLOW    Money Flow Index re-centred. Auto-disabled when the feed
+//                     carries no usable volume.
+//   7  HTF BIAS       The same slope+displacement core evaluated on chart x N,
+//                     via request.security with lookahead_off and (by default)
+//                     the last CLOSED higher-timeframe bar.
+//
+//  SCORE = 100 * Σ(weight_i × bias_i) / Σ(weight_i over ENABLED+AVAILABLE factors)
+//  A factor with weight 0 is excluded from both sums, so the scale never shifts.
+//
+//  OVER-EXTENSION GUARD
+//  --------------------
+//  When |price - MA| exceeds the stretch limit (in ATR), the score is damped.
+//  A very stretched market is exactly where trend-following entries pay worst,
+//  so conviction is reduced rather than amplified.
+//
+//  REGIME CLASSIFIER
+//  -----------------
+//   COMPRESSION     Bollinger bands inside Keltner channels (volatility squeeze)
+//   TREND UP/DOWN   ADX above floor AND |score| above 60% of the entry threshold
+//   VOLATILE RANGE  ATR in the top percentile band but no directional agreement
+//   RANGE           everything else
+//
+//  PLAYBOOKS (auto-selected by regime, or forced manually)
+//  -------------------------------------------------------
+//   TREND  -> continuation: score crosses ±threshold
+//   RANGE  -> reversion:    score recovers out of an extreme after a stretched move
+//   ANY    -> breakout:     the squeeze releases with the score already leaning
+//
+//  REPAINTING POLICY (stated explicitly, because it matters)
+//  ---------------------------------------------------------
+//   * request.security uses lookahead_off and, with "Use last CLOSED HTF bar"
+//     on (default), reads the previous completed HTF bar -> no future leak.
+//   * Swing pivots confirm `pivot strength` bars after they form. That lag is
+//     inherent to pivots. Structure state therefore updates late, never early.
+//   * With "Only evaluate on closed bars" on (default), signals are emitted on
+//     bar close only, so a live bar cannot paint and un-paint an arrow.
+//   * Turn that option off and you get faster, intrabar-mutable signals. That is
+//     a deliberate trade-off, not a bug — the setting names it.
+//
+//  This is a research / decision-support tool. It is not financial advice.
+// =============================================================================
+
+indicator("Universal Regime Engine [Finn]", shorttitle = "FURE", overlay = true,
+     max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
+
+// -----------------------------------------------------------------------------
+// 0 · INPUTS
+// -----------------------------------------------------------------------------
+grpCore = "① Engine core"
+src        = input.source(close, "Source", group = grpCore)
+atrLen     = input.int(14, "ATR length (the universal ruler)", minval = 2, group = grpCore, tooltip = "Every distance in this script is divided by this ATR. It is what makes one setting work on a 5-digit FX pair and on a 6-figure crypto pair.")
+erLen      = input.int(20, "Adaptive MA · efficiency window", minval = 2, group = grpCore)
+kFast      = input.int(2,  "Adaptive MA · fast constant", minval = 1, group = grpCore)
+kSlow      = input.int(30, "Adaptive MA · slow constant", minval = 2, group = grpCore)
+slopeLen   = input.int(5,  "Slope lookback (bars)", minval = 1, group = grpCore)
+slopeNorm  = input.float(0.75, "Full slope score at (ATR over lookback)", minval = 0.05, step = 0.05, group = grpCore)
+distNorm   = input.float(2.0,  "Full displacement score at (ATR)", minval = 0.1, step = 0.1, group = grpCore)
+stretchMax = input.float(3.0,  "Over-extension guard (ATR)", minval = 0.5, step = 0.25, group = grpCore)
+rsiLen     = input.int(14, "RSI length", minval = 2, group = grpCore)
+mfiLen     = input.int(14, "MFI length", minval = 2, group = grpCore)
+smoothLen  = input.int(2,  "Score smoothing (EMA bars)", minval = 1, maxval = 50, group = grpCore)
+
+grpW = "② Factor weights  ·  set 0 to disable a factor entirely"
+wTrend  = input.float(1.5,  "1 · Trend slope",          minval = 0, maxval = 5, step = 0.1, group = grpW)
+wDist   = input.float(1.0,  "2 · Displacement vs MA",   minval = 0, maxval = 5, step = 0.1, group = grpW)
+wMom    = input.float(1.0,  "3 · Momentum (RSI)",       minval = 0, maxval = 5, step = 0.1, group = grpW)
+wAdx    = input.float(1.0,  "4 · Directional strength", minval = 0, maxval = 5, step = 0.1, group = grpW)
+wStruct = input.float(1.5,  "5 · Market structure",     minval = 0, maxval = 5, step = 0.1, group = grpW)
+wFlow   = input.float(0.75, "6 · Volume flow (MFI)",    minval = 0, maxval = 5, step = 0.1, group = grpW)
+wHtf    = input.float(1.25, "7 · Higher-timeframe bias",minval = 0, maxval = 5, step = 0.1, group = grpW)
+
+grpReg = "③ Regime classifier"
+diLen       = input.int(14, "DI length", minval = 2, group = grpReg)
+adxSm       = input.int(14, "ADX smoothing", minval = 1, group = grpReg)
+adxFloor    = input.float(20.0, "ADX trend floor", minval = 5, maxval = 60, step = 1, group = grpReg)
+adxFull     = input.float(40.0, "ADX at full conviction", minval = 15, maxval = 80, step = 1, group = grpReg)
+sqzLen      = input.int(20, "Squeeze length", minval = 5, group = grpReg)
+bbMult      = input.float(2.0, "Bollinger multiple", minval = 0.5, step = 0.1, group = grpReg)
+kcMult      = input.float(1.5, "Keltner multiple", minval = 0.5, step = 0.1, group = grpReg)
+volRankLen  = input.int(100, "Volatility percentile window", minval = 20, group = grpReg)
+volHot      = input.float(80.0, "Volatile-range percentile", minval = 50, maxval = 100, step = 1, group = grpReg)
+pvtLen      = input.int(5, "Swing pivot strength (bars each side)", minval = 1, group = grpReg)
+structMem   = input.int(50, "Structure memory / decay (bars)", minval = 5, group = grpReg)
+
+grpHtf = "④ Higher-timeframe context"
+htfMode   = input.string("Auto (chart × N)", "HTF mode", options = ["Auto (chart × N)", "Manual", "Off"], group = grpHtf)
+htfMult   = input.int(4, "Auto multiple", minval = 2, maxval = 24, group = grpHtf, tooltip = "4 is the classic ratio: 5m→20m, 1H→4H, 1D→4D. Derived from the chart, so it scales with whatever timeframe you open.")
+htfManual = input.timeframe("240", "Manual timeframe", group = grpHtf)
+htfStrict = input.bool(true, "Use last CLOSED HTF bar (non-repainting)", group = grpHtf)
+
+grpSig = "⑤ Signal engine"
+sigMode   = input.string("Auto (regime aware)", "Playbook", options = ["Auto (regime aware)", "Trend-following only", "Mean-reversion only", "Breakout only"], group = grpSig)
+entryTh   = input.float(35.0, "Entry |score| threshold", minval = 5, maxval = 95, step = 1, group = grpSig)
+exitTh    = input.float(10.0, "Flat / stand-aside |score|", minval = 0, maxval = 90, step = 1, group = grpSig)
+mrStretch = input.float(1.0, "Reversion needs prior stretch (ATR)", minval = 0, step = 0.25, group = grpSig)
+needStruct= input.bool(true, "Require market-structure agreement", group = grpSig)
+needHtf   = input.bool(true, "Require higher-timeframe agreement", group = grpSig)
+cooldown  = input.int(5, "Cooldown between signals (bars)", minval = 0, group = grpSig)
+closedOnly= input.bool(true, "Only evaluate on closed bars", group = grpSig)
+
+grpRisk = "⑥ Risk model"
+stopMode = input.string("Structure + ATR buffer", "Stop placement", options = ["Structure + ATR buffer", "Pure ATR", "Chandelier"], group = grpRisk)
+atrStop  = input.float(1.5, "ATR multiple", minval = 0.2, step = 0.1, group = grpRisk)
+swingLB  = input.int(10, "Structure lookback for the stop (bars)", minval = 2, group = grpRisk)
+rt1      = input.float(1.0, "Target 1 (R)", minval = 0.25, step = 0.25, group = grpRisk)
+rt2      = input.float(2.0, "Target 2 (R)", minval = 0.25, step = 0.25, group = grpRisk)
+rt3      = input.float(3.0, "Target 3 (R)", minval = 0.25, step = 0.25, group = grpRisk)
+acctSize = input.float(10000, "Account size (position-size hint)", minval = 0, group = grpRisk)
+riskPct  = input.float(1.0, "Risk per trade %", minval = 0.01, step = 0.05, group = grpRisk)
+projBars = input.int(30, "Project levels forward (bars)", minval = 5, group = grpRisk)
+
+grpVis = "⑦ Visuals"
+showMA     = input.bool(true, "Adaptive MA + envelope", group = grpVis)
+showStruct = input.bool(true, "Structure breaks (BOS / CHoCH)", group = grpVis)
+showSig    = input.bool(true, "Signal arrows", group = grpVis)
+showRisk   = input.bool(true, "Stop / target levels", group = grpVis)
+showBg     = input.bool(true, "Shade compression regime", group = grpVis)
+showPanel  = input.bool(true, "Transparency panel", group = grpVis)
+tblPos     = input.string("Top right", "Panel position", options = ["Top right", "Top left", "Bottom right", "Bottom left", "Middle right"], group = grpVis)
+darkUI     = input.bool(true, "Dark panel", group = grpVis)
+cBull      = input.color(#089981, "Bull", inline = "col", group = grpVis)
+cBear      = input.color(#f23645, "Bear", inline = "col", group = grpVis)
+cNeut      = input.color(#787b86, "Neutral", inline = "col", group = grpVis)
+
+// -----------------------------------------------------------------------------
+// 1 · HELPERS
+// -----------------------------------------------------------------------------
+f_clamp(v, lo, hi) => math.max(lo, math.min(hi, v))
+
+// Kaufman Adaptive Moving Average.
+// efficiency ratio = |net move| / |sum of absolute moves|  ->  0 = pure noise,
+// 1 = a perfectly straight line. The smoothing constant is interpolated between
+// the fast and slow EMA constants by that ratio, then squared.
+f_kama(source, erWin, fastN, slowN) =>
+    float step   = math.abs(source - nz(source[1], source))
+    float noise  = math.sum(step, erWin)
+    float signal = math.abs(source - nz(source[erWin], source))
+    float er     = noise > 0 ? signal / noise : 0.0
+    float fsc    = 2.0 / (fastN + 1.0)
+    float ssc    = 2.0 / (slowN + 1.0)
+    float sc     = math.pow(er * (fsc - ssc) + ssc, 2.0)
+    var float out = na
+    out := na(out) ? source : out + sc * (source - out)
+    out
+
+// Seconds -> a timeframe string TradingView accepts, so the HTF can be derived
+// from whatever chart the user happens to open.
+f_tfString(secs) =>
+    string r = "D"
+    if secs < 60
+        r := str.tostring(math.max(1, math.round(secs)), "#") + "S"
+    else if secs < 86400
+        r := str.tostring(math.max(1, math.round(secs / 60.0)), "#")
+    else if secs < 604800
+        r := str.tostring(math.max(1, math.round(secs / 86400.0)), "#") + "D"
+    else if secs < 2419200
+        r := str.tostring(math.max(1, math.round(secs / 604800.0)), "#") + "W"
+    else
+        r := str.tostring(math.max(1, math.round(secs / 2592000.0)), "#") + "M"
+    r
+
+// Text gauge for the panel: -1 .. +1  ->  "◄███··" / "►███··"
+f_gauge(v) =>
+    float c = f_clamp(v, -1.0, 1.0)
+    float n = math.abs(c) * 5.0
+    string s = ""
+    for i = 1 to 5
+        s := s + (i <= n + 0.5 ? "█" : "·")
+    (c < -0.02 ? "◄ " : c > 0.02 ? "► " : "· ") + s
+
+// The slope+displacement core, isolated so the SAME maths can be evaluated in a
+// higher-timeframe context by request.security.
+f_biasCore() =>
+    float k  = f_kama(close, erLen, kFast, kSlow)
+    float a  = ta.atr(atrLen)
+    float sl = a > 0 ? (k - k[slopeLen]) / a : 0.0
+    float ds = a > 0 ? (close - k) / a : 0.0
+    0.6 * f_clamp(sl / slopeNorm, -1.0, 1.0) + 0.4 * f_clamp(ds / distNorm, -1.0, 1.0)
+
+f_htfPacket(sh) =>
+    float b = f_biasCore()
+    b[sh]
+
+// -----------------------------------------------------------------------------
+// 2 · VOLATILITY BASE  (the ruler everything else is measured against)
+// -----------------------------------------------------------------------------
+float atr    = ta.atr(atrLen)
+float atrPct = close != 0 ? atr / close * 100.0 : 0.0
+float volPct = ta.percentrank(atr, volRankLen)
+
+// -----------------------------------------------------------------------------
+// 3 · FACTOR 1 & 2 — adaptive trend slope and displacement
+// -----------------------------------------------------------------------------
+float kama     = f_kama(src, erLen, kFast, kSlow)
+float slopeATR = atr > 0 ? (kama - kama[slopeLen]) / atr : 0.0
+float distATR  = atr > 0 ? (src - kama) / atr : 0.0
+float sTrend   = f_clamp(slopeATR / slopeNorm, -1.0, 1.0)
+float sDist    = f_clamp(distATR / distNorm, -1.0, 1.0)
+
+// -----------------------------------------------------------------------------
+// 4 · FACTOR 3 — momentum
+// -----------------------------------------------------------------------------
+float rsi  = ta.rsi(src, rsiLen)
+float sMom = f_clamp((nz(rsi, 50.0) - 50.0) / 25.0, -1.0, 1.0)
+
+// -----------------------------------------------------------------------------
+// 5 · FACTOR 4 — directional strength (direction × conviction, kept separate)
+// -----------------------------------------------------------------------------
+[diPlus, diMinus, adxVal] = ta.dmi(diLen, adxSm)
+float diBal  = (diPlus + diMinus) > 0 ? (diPlus - diMinus) / (diPlus + diMinus) : 0.0
+float adxMag = f_clamp(nz(adxVal) / adxFull, 0.0, 1.0)
+float sAdx   = f_clamp(diBal, -1.0, 1.0) * adxMag
+
+// -----------------------------------------------------------------------------
+// 6 · FACTOR 5 — market structure (BOS / CHoCH) from confirmed pivots
+//     A pivot confirms `pvtLen` bars after it prints; the state therefore
+//     updates LATE, never early. That lag is disclosed, not hidden.
+// -----------------------------------------------------------------------------
+float ph = ta.pivothigh(high, pvtLen, pvtLen)
+float pl = ta.pivotlow(low, pvtLen, pvtLen)
+
+var float lastPH   = na
+var float lastPL   = na
+var int   lastPHbar = na
+var int   lastPLbar = na
+var bool  phLive   = false
+var bool  plLive   = false
+var int   structDir = 0
+var int   structBar = na
+var float structLvl = na
+
+if not na(ph)
+    lastPH    := ph
+    lastPHbar := bar_index - pvtLen
+    phLive    := true
+if not na(pl)
+    lastPL    := pl
+    lastPLbar := bar_index - pvtLen
+    plLive    := true
+
+bool rawBosUp = phLive and not na(lastPH) and close > lastPH
+bool rawBosDn = plLive and not na(lastPL) and close < lastPL
+// An outside bar can break both sides at once — resolve by where it closed.
+bool bosUp = rawBosUp and (not rawBosDn or close >= open)
+bool bosDn = rawBosDn and (not rawBosUp or close <  open)
+
+bool chochUp = bosUp and structDir <= 0
+bool chochDn = bosDn and structDir >= 0
+
+if bosUp
+    phLive    := false
+    structDir := 1
+    structBar := bar_index
+    structLvl := lastPH
+if bosDn
+    plLive    := false
+    structDir := -1
+    structBar := bar_index
+    structLvl := lastPL
+
+float structFade = na(structBar) ? 0.0 : math.max(0.25, 1.0 - (bar_index - structBar) * 1.0 / (structMem * 1.0))
+float sStruct    = structDir * structFade
+
+// -----------------------------------------------------------------------------
+// 7 · FACTOR 6 — volume flow, with graceful degradation
+//     Many FX / index / CFD feeds report no volume at all. Rather than feeding
+//     the blend a fake zero, the factor is dropped and its weight is removed
+//     from the denominator so the -100..+100 scale is preserved.
+// -----------------------------------------------------------------------------
+float volAvg   = ta.sma(nz(volume), 20)
+bool  volUsable = volAvg > 0
+float mfi      = ta.mfi(hlc3, mfiLen)
+float sFlow    = volUsable ? f_clamp((nz(mfi, 50.0) - 50.0) / 25.0, -1.0, 1.0) : 0.0
+
+// -----------------------------------------------------------------------------
+// 8 · FACTOR 7 — higher-timeframe bias (derived from the chart timeframe)
+// -----------------------------------------------------------------------------
+bool   htfOn  = htfMode != "Off"
+string htfRes = htfMode == "Manual" ? htfManual : f_tfString(timeframe.in_seconds(timeframe.period) * htfMult * 1.0)
+int    htfShift = htfStrict ? 1 : 0
+float  htfRaw = request.security(syminfo.tickerid, htfRes, f_htfPacket(htfShift), lookahead = barmerge.lookahead_off)
+float  sHtf   = htfOn ? f_clamp(nz(htfRaw), -1.0, 1.0) : 0.0
+
+// -----------------------------------------------------------------------------
+// 9 · CONFLUENCE SCORE
+//     Weighted mean over the factors that are both enabled (weight > 0) and
+//     available (volume present, HTF on). Σweights is recomputed every bar, so
+//     disabling factors rescales rather than deadens the score.
+// -----------------------------------------------------------------------------
+float wSum = 0.0
+float cSum = 0.0
+
+if wTrend > 0
+    wSum += wTrend
+    cSum += wTrend * sTrend
+if wDist > 0
+    wSum += wDist
+    cSum += wDist * sDist
+if wMom > 0
+    wSum += wMom
+    cSum += wMom * sMom
+if wAdx > 0
+    wSum += wAdx
+    cSum += wAdx * sAdx
+if wStruct > 0
+    wSum += wStruct
+    cSum += wStruct * sStruct
+if wFlow > 0 and volUsable
+    wSum += wFlow
+    cSum += wFlow * sFlow
+if wHtf > 0 and htfOn
+    wSum += wHtf
+    cSum += wHtf * sHtf
+
+float rawScore = wSum > 0 ? 100.0 * cSum / wSum : 0.0
+
+// Over-extension guard: conviction falls once price is unusually far from value.
+float stretch = math.abs(distATR)
+float damp    = stretch > stretchMax ? math.max(0.35, 1.0 - (stretch - stretchMax) / (stretchMax * 2.0)) : 1.0
+float score   = ta.ema(rawScore * damp, smoothLen)
+
+// -----------------------------------------------------------------------------
+// 10 · REGIME CLASSIFIER
+//      Squeeze: lowerBB > lowerKC and upperBB < upperKC. Both reduce to the
+//      same inequality, so it is computed once: bbDev < kcMult * ATR-ish range.
+// -----------------------------------------------------------------------------
+float basis   = ta.sma(close, sqzLen)
+float bbDev   = bbMult * ta.stdev(close, sqzLen)
+float kcRange = ta.sma(ta.tr(true), sqzLen)
+bool  sqzOn   = bbDev < kcMult * kcRange
+
+bool trending = nz(adxVal) >= adxFloor and math.abs(score) >= entryTh * 0.6
+string regime = sqzOn ? "COMPRESSION" :
+     trending and score > 0 ? "TREND UP" :
+     trending and score < 0 ? "TREND DOWN" :
+     volPct >= volHot ? "VOLATILE RANGE" : "RANGE"
+
+bool trendUp    = regime == "TREND UP"
+bool trendDn    = regime == "TREND DOWN"
+bool ranging    = regime == "RANGE" or regime == "VOLATILE RANGE"
+bool expansion  = sqzOn[1] and not sqzOn
+
+var int barsInRegime = 0
+barsInRegime := regime == regime[1] ? barsInRegime + 1 : 0
+
+// -----------------------------------------------------------------------------
+// 11 · PLAYBOOKS
+// -----------------------------------------------------------------------------
+// A · continuation — score pushes through the threshold
+bool tfL = ta.crossover(score, entryTh)
+bool tfS = ta.crossunder(score, -entryTh)
+// B · reversion — score climbs back out of an extreme AFTER a stretched move
+bool mrL = ta.crossover(score, -entryTh)  and ta.lowest(distATR, 5)  <= -mrStretch
+bool mrS = ta.crossunder(score, entryTh)  and ta.highest(distATR, 5) >=  mrStretch
+// C · breakout — the squeeze releases with the score already leaning
+bool brL = expansion and score >  entryTh * 0.5 and close > basis
+bool brS = expansion and score < -entryTh * 0.5 and close < basis
+
+bool baseL = switch sigMode
+    "Trend-following only" => tfL
+    "Mean-reversion only"  => mrL and ranging
+    "Breakout only"        => brL
+    => brL or ((trendUp or trendDn) ? tfL : ranging ? mrL : false)
+
+bool baseS = switch sigMode
+    "Trend-following only" => tfS
+    "Mean-reversion only"  => mrS and ranging
+    "Breakout only"        => brS
+    => brS or ((trendUp or trendDn) ? tfS : ranging ? mrS : false)
+
+// Gates
+bool barOk     = closedOnly ? barstate.isconfirmed : true
+bool structOkL = not needStruct or structDir >= 0
+bool structOkS = not needStruct or structDir <= 0
+bool htfOkL    = not needHtf or not htfOn or sHtf > 0
+bool htfOkS    = not needHtf or not htfOn or sHtf < 0
+
+bool candL = baseL and structOkL and htfOkL and barOk
+bool candS = baseS and structOkS and htfOkS and barOk
+
+var int lastSigBar = -100000
+bool cooled  = (bar_index - lastSigBar) > cooldown
+bool longSig  = candL and not candS and cooled
+bool shortSig = candS and not candL and cooled
+if longSig or shortSig
+    lastSigBar := bar_index
+
+// Engine stance: what the tool thinks you should be doing right now
+var int stance = 0
+if longSig
+    stance := 1
+if shortSig
+    stance := -1
+bool standDown = stance != 0 and math.abs(score) < exitTh
+if standDown
+    stance := 0
+
+// -----------------------------------------------------------------------------
+// 12 · RISK MODEL — stop first, then targets as multiples of the actual risk
+// -----------------------------------------------------------------------------
+float swingLo = ta.lowest(low, swingLB)
+float swingHi = ta.highest(high, swingLB)
+
+float stopL = stopMode == "Pure ATR"   ? close - atrStop * atr :
+     stopMode == "Chandelier"          ? swingHi - atrStop * atr :
+     swingLo - 0.5 * atrStop * atr
+float stopS = stopMode == "Pure ATR"   ? close + atrStop * atr :
+     stopMode == "Chandelier"          ? swingLo + atrStop * atr :
+     swingHi + 0.5 * atrStop * atr
+
+// Never let a structural stop land on the wrong side of price.
+stopL := stopL >= close ? close - atrStop * atr : stopL
+stopS := stopS <= close ? close + atrStop * atr : stopS
+
+var float eEntry = na
+var float eStop  = na
+var float eT1    = na
+var float eT2    = na
+var float eT3    = na
+var int   eDir   = 0
+
+if longSig
+    eEntry := close
+    eStop  := stopL
+    eDir   := 1
+    float rUnit = eEntry - eStop
+    eT1 := eEntry + rt1 * rUnit
+    eT2 := eEntry + rt2 * rUnit
+    eT3 := eEntry + rt3 * rUnit
+if shortSig
+    eEntry := close
+    eStop  := stopS
+    eDir   := -1
+    float rUnitS = eStop - eEntry
+    eT1 := eEntry - rt1 * rUnitS
+    eT2 := eEntry - rt2 * rUnitS
+    eT3 := eEntry - rt3 * rUnitS
+
+float riskPerUnit = na(eEntry) ? na : math.abs(eEntry - eStop)
+float riskATR     = na(riskPerUnit) or atr <= 0 ? na : riskPerUnit / atr
+float sizeUnits   = na(riskPerUnit) or riskPerUnit <= 0 ? na : acctSize * riskPct / 100.0 / riskPerUnit
+
+// -----------------------------------------------------------------------------
+// 13 · VISUALS
+// -----------------------------------------------------------------------------
+color trendCol = score > 15 ? cBull : score < -15 ? cBear : cNeut
+float kamaSig  = ta.ema(kama, math.max(2, erLen / 2))
+
+pMa  = plot(showMA ? kama : na, "Adaptive MA", color = trendCol, linewidth = 2)
+pSig = plot(showMA ? kamaSig : na, "MA envelope", color = color.new(trendCol, 55), linewidth = 1)
+fill(pMa, pSig, color = color.new(trendCol, 88), title = "Trend envelope")
+
+bgcolor(showBg and sqzOn ? color.new(cNeut, 90) : na, title = "Compression")
+
+plot(showStruct ? structLvl : na, "Active structure level", color = color.new(structDir > 0 ? cBull : cBear, 35), style = plot.style_linebr, linewidth = 1)
+
+if showStruct and (bosUp or bosDn)
+    int   fromBar = bosUp ? nz(lastPHbar, bar_index - pvtLen) : nz(lastPLbar, bar_index - pvtLen)
+    float lvl     = bosUp ? lastPH : lastPL
+    bool  isChoch = bosUp ? chochUp : chochDn
+    line.new(fromBar, lvl, bar_index, lvl, color = color.new(bosUp ? cBull : cBear, 25), style = isChoch ? line.style_solid : line.style_dotted, width = isChoch ? 2 : 1)
+    label.new(bar_index, lvl, isChoch ? "CHoCH" : "BOS", style = bosUp ? label.style_label_down : label.style_label_up, color = color.new(bosUp ? cBull : cBear, 20), textcolor = color.white, size = size.tiny)
+
+plotshape(showSig and longSig,  "Long signal",  shape.triangleup,   location.belowbar, color = cBull, size = size.small, text = "LONG")
+plotshape(showSig and shortSig, "Short signal", shape.triangledown, location.abovebar, color = cBear, size = size.small, text = "SHORT")
+plotshape(showSig and standDown, "Stand aside", shape.xcross, location.top, color = cNeut, size = size.tiny)
+
+var line lnStop = na
+var line lnEnt  = na
+var line lnT1   = na
+var line lnT2   = na
+var line lnT3   = na
+var label lbSet = na
+
+if showRisk and (longSig or shortSig)
+    line.delete(lnStop)
+    line.delete(lnEnt)
+    line.delete(lnT1)
+    line.delete(lnT2)
+    line.delete(lnT3)
+    label.delete(lbSet)
+    int x2 = bar_index + projBars
+    lnEnt  := line.new(bar_index, eEntry, x2, eEntry, color = cNeut,  style = line.style_solid,  width = 1)
+    lnStop := line.new(bar_index, eStop,  x2, eStop,  color = cBear,  style = line.style_dashed, width = 1)
+    lnT1   := line.new(bar_index, eT1,    x2, eT1,    color = cBull,  style = line.style_dotted, width = 1)
+    lnT2   := line.new(bar_index, eT2,    x2, eT2,    color = cBull,  style = line.style_dotted, width = 1)
+    lnT3   := line.new(bar_index, eT3,    x2, eT3,    color = cBull,  style = line.style_dotted, width = 1)
+    lbSet  := label.new(x2, eStop,
+         (eDir > 0 ? "LONG  " : "SHORT ") + str.tostring(eEntry, format.mintick) +
+         "\nstop " + str.tostring(eStop, format.mintick) + "  (" + str.tostring(riskATR, "#.##") + " ATR)" +
+         "\nT1 " + str.tostring(eT1, format.mintick) + "  T2 " + str.tostring(eT2, format.mintick) + "  T3 " + str.tostring(eT3, format.mintick) +
+         "\nsize ≈ " + str.tostring(sizeUnits, "#.####") + " units",
+         style = label.style_label_left, color = color.new(eDir > 0 ? cBull : cBear, 15), textcolor = color.white, size = size.small)
+
+// Numeric detail for the Data Window — every intermediate value is inspectable.
+plot(score,     "Confluence score", display = display.data_window)
+plot(rawScore,  "Raw score (pre-damp)", display = display.data_window)
+plot(sTrend,    "F1 trend slope", display = display.data_window)
+plot(sDist,     "F2 displacement", display = display.data_window)
+plot(sMom,      "F3 momentum", display = display.data_window)
+plot(sAdx,      "F4 directional", display = display.data_window)
+plot(sStruct,   "F5 structure", display = display.data_window)
+plot(sFlow,     "F6 volume flow", display = display.data_window)
+plot(sHtf,      "F7 HTF bias", display = display.data_window)
+plot(atrPct,    "ATR %", display = display.data_window)
+plot(volPct,    "Volatility percentile", display = display.data_window)
+plot(slopeATR,  "Slope (ATR)", display = display.data_window)
+plot(distATR,   "Displacement (ATR)", display = display.data_window)
+
+// -----------------------------------------------------------------------------
+// 14 · TRANSPARENCY PANEL
+//      The point of this block: nothing in the score is a black box. Every
+//      factor shows its raw reading, its normalised bias, its weight and the
+//      exact number of points it contributed to the score on this bar.
+// -----------------------------------------------------------------------------
+tablePos = tblPos == "Top left" ? position.top_left :
+     tblPos == "Bottom right"   ? position.bottom_right :
+     tblPos == "Bottom left"    ? position.bottom_left :
+     tblPos == "Middle right"   ? position.middle_right : position.top_right
+
+color cPanel = darkUI ? color.new(#131722, 12) : color.new(#ffffff, 8)
+color cHdr   = darkUI ? color.new(#2a2e39, 8)  : color.new(#e0e3eb, 8)
+color cTxt   = darkUI ? #d1d4dc : #131722
+color cDim   = darkUI ? #787b86 : #5d606b
+
+var table dash = table.new(tablePos, 5, 24, border_width = 1, frame_width = 1, frame_color = cHdr)
+
+f_row(t, r, c0, c1, c2, c3, c4, col, bg) =>
+    table.cell(t, 0, r, c0, text_color = cDim, bgcolor = bg, text_size = size.small, text_halign = text.align_left)
+    table.cell(t, 1, r, c1, text_color = col, bgcolor = bg, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 2, r, c2, text_color = col, bgcolor = bg, text_size = size.small, text_halign = text.align_left)
+    table.cell(t, 3, r, c3, text_color = cDim, bgcolor = bg, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 4, r, c4, text_color = col, bgcolor = bg, text_size = size.small, text_halign = text.align_right)
+
+if showPanel and barstate.islast
+    color cScore  = score > 15 ? cBull : score < -15 ? cBear : cNeut
+    color cRegime = trendUp ? cBull : trendDn ? cBear : regime == "COMPRESSION" ? color.new(#f7a600, 0) : cNeut
+
+    f_row(dash, 0, "UNIVERSAL REGIME ENGINE", syminfo.ticker, "", timeframe.period, "", cTxt, cHdr)
+    f_row(dash, 1, "Confluence score", str.tostring(score, "#.#"), f_gauge(score / 100.0), "±100", str.tostring(wSum, "#.##") + "w", cScore, cPanel)
+    f_row(dash, 2, "Regime", regime, "", "bars", str.tostring(barsInRegime), cRegime, cPanel)
+    f_row(dash, 3, "Playbook", sigMode == "Auto (regime aware)" ? ((trendUp or trendDn) ? "continuation" : ranging ? "reversion" : "await expansion") : sigMode, "", "", "", cTxt, cPanel)
+
+    f_row(dash, 4, "FACTOR", "READING", "BIAS", "W", "PTS", cTxt, cHdr)
+
+    array<string> fName = array.from("1 Trend slope", "2 Displacement", "3 Momentum (RSI)", "4 Directional", "5 Structure", "6 Volume flow", "7 HTF " + htfRes)
+    array<string> fRead = array.from(
+         str.tostring(slopeATR, "#.##") + " atr",
+         str.tostring(distATR, "#.##") + " atr",
+         str.tostring(rsi, "#.#"),
+         str.tostring(adxVal, "#.#") + " adx",
+         structDir > 0 ? "bullish" : structDir < 0 ? "bearish" : "none",
+         volUsable ? str.tostring(mfi, "#.#") : "n/a",
+         htfOn ? str.tostring(sHtf, "#.##") : "off")
+    array<float>  fBias = array.from(sTrend, sDist, sMom, sAdx, sStruct, sFlow, sHtf)
+    array<float>  fW    = array.from(wTrend, wDist, wMom, wAdx, wStruct, wFlow, wHtf)
+    array<bool>   fOk   = array.from(true, true, true, true, true, volUsable, htfOn)
+
+    for i = 0 to 6
+        float w   = array.get(fW, i)
+        bool  on  = w > 0 and array.get(fOk, i)
+        float b   = array.get(fBias, i)
+        float pts = on and wSum > 0 ? 100.0 * w * b / wSum : 0.0
+        color rc  = not on ? cDim : b > 0.05 ? cBull : b < -0.05 ? cBear : cNeut
+        f_row(dash, 5 + i, array.get(fName, i), on ? array.get(fRead, i) : "off",
+             on ? f_gauge(b) : "—", str.tostring(w, "#.##"), on ? str.tostring(pts, "#.#") : "—", rc, cPanel)
+
+    f_row(dash, 12, "CONTEXT", "", "", "", "", cTxt, cHdr)
+    f_row(dash, 13, "ATR (volatility ruler)", str.tostring(atrPct, "#.##") + "%", f_gauge(volPct / 50.0 - 1.0), "pct", str.tostring(volPct, "#") , cTxt, cPanel)
+    f_row(dash, 14, "Squeeze", sqzOn ? "ON — coiled" : "off", "", "", "", sqzOn ? color.new(#f7a600, 0) : cDim, cPanel)
+    f_row(dash, 15, "Over-extension damp", str.tostring(damp * 100.0, "#") + "%", "", "stretch", str.tostring(stretch, "#.##"), damp < 1 ? color.new(#f7a600, 0) : cDim, cPanel)
+    f_row(dash, 16, "Volume feed", volUsable ? "usable" : "absent → factor dropped", "", "", "", volUsable ? cTxt : cDim, cPanel)
+
+    f_row(dash, 17, "ACTIVE SETUP", "", "", "", "", cTxt, cHdr)
+    f_row(dash, 18, "Stance", stance > 0 ? "LONG" : stance < 0 ? "SHORT" : "flat", "", "since", na(eEntry) ? "—" : str.tostring(bar_index - lastSigBar) + "b", stance > 0 ? cBull : stance < 0 ? cBear : cDim, cPanel)
+    f_row(dash, 19, "Entry", na(eEntry) ? "—" : str.tostring(eEntry, format.mintick), "", "", "", cTxt, cPanel)
+    f_row(dash, 20, "Stop", na(eStop) ? "—" : str.tostring(eStop, format.mintick), "", "atr", na(riskATR) ? "—" : str.tostring(riskATR, "#.##"), cBear, cPanel)
+    f_row(dash, 21, "Targets 1 / 2 / 3", na(eT1) ? "—" : str.tostring(eT1, format.mintick) + " / " + str.tostring(eT2, format.mintick) + " / " + str.tostring(eT3, format.mintick), "", "R", str.tostring(rt1, "#.#") + "/" + str.tostring(rt2, "#.#") + "/" + str.tostring(rt3, "#.#"), cBull, cPanel)
+    f_row(dash, 22, "Size @ " + str.tostring(riskPct, "#.##") + "% risk", na(sizeUnits) ? "—" : str.tostring(sizeUnits, "#.####") + " units", "", "risk", na(riskPerUnit) ? "—" : str.tostring(acctSize * riskPct / 100.0, "#.##"), cTxt, cPanel)
+    f_row(dash, 23, closedOnly ? "Closed-bar signals" : "Intrabar signals (mutable)", htfStrict ? "HTF: closed bar" : "HTF: live bar", "", "", "", cDim, cPanel)
+
+// -----------------------------------------------------------------------------
+// 15 · ALERTS
+// -----------------------------------------------------------------------------
+alertcondition(longSig,  "FURE · Long signal",  "FURE LONG {{ticker}} {{interval}}")
+alertcondition(shortSig, "FURE · Short signal", "FURE SHORT {{ticker}} {{interval}}")
+alertcondition(standDown, "FURE · Stand aside", "FURE STAND ASIDE {{ticker}} {{interval}}")
+alertcondition(regime != regime[1], "FURE · Regime change", "FURE regime change {{ticker}} {{interval}}")
+alertcondition(chochUp or chochDn, "FURE · Change of character", "FURE CHoCH {{ticker}} {{interval}}")
+
+if longSig or shortSig
+    alert((longSig ? "FURE LONG " : "FURE SHORT ") + syminfo.ticker + " " + timeframe.period +
+         " | score " + str.tostring(score, "#.#") +
+         " | regime " + regime +
+         " | entry " + str.tostring(eEntry, format.mintick) +
+         " | stop " + str.tostring(eStop, format.mintick) +
+         " | T1 " + str.tostring(eT1, format.mintick) +
+         " | T2 " + str.tostring(eT2, format.mintick) +
+         " | T3 " + str.tostring(eT3, format.mintick) +
+         " | risk " + str.tostring(riskATR, "#.##") + " ATR", alert.freq_once_per_bar_close)
