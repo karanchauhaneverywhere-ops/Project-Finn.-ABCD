@@ -8,9 +8,21 @@ written in **Pine Script v6**.
 | `indicators/Universal_Regime_Engine.pine` | The indicator. Chart overlay + full transparency panel. |
 | `strategies/Universal_Regime_Strategy.pine` | The executable twin. Identical engine, plus order execution, sizing, scale-outs and trailing. |
 | `METHODOLOGY.md` | Every formula, every threshold, and why each one is there. |
+| `tools/check_engine_drift.py` | Fails if the shared engine block has drifted between the two scripts. |
 
-The two scripts share the **same engine source block**, copied verbatim, so the
-strategy can never silently diverge from what the indicator draws.
+The two scripts share the **same engine source block**, copied verbatim between
+`>>>>> ENGINE BLOCK START` and `<<<<< ENGINE BLOCK END` markers, so the strategy
+cannot silently diverge from what the indicator draws. TradingView has no way to
+share code between two *unpublished* scripts — a Pine `library()` must be published
+before it can be imported — so the duplication is deliberate. Run
+
+```bash
+python3 tools/check_engine_drift.py
+```
+
+after editing the engine; it exits non-zero and prints a diff if the two copies no
+longer match. Display-only inputs deliberately live *outside* the marked block, so
+the strategy never carries an input that does nothing.
 
 ---
 
@@ -117,6 +129,11 @@ You can force a single playbook (`Trend-following only`, `Mean-reversion only`,
   bar close, so a live bar cannot paint and un-paint an arrow.
 * Turn that option off and you get faster, intrabar-mutable signals. That is a
   deliberate trade-off — the setting names it.
+* A displayed setup is **invalidated** when price trades through its stop or
+  reaches T3, not only when the score fades. A hard reversal can take the score
+  from +40 to −40 without ever crossing the stand-aside band, so without that check
+  the panel would keep showing a long that was stopped out hundreds of bars ago.
+  The panel says which of the three ended it.
 
 ---
 
@@ -132,10 +149,33 @@ The defaults are round, standard numbers chosen because they are conventional,
 | Instrument without real volume (many FX / index / CFD feeds) | nothing — the engine detects it and drops the volume factor automatically, rescaling the remaining weights |
 | 24/5 FX vs 24/7 crypto vs session-bound equities | nothing — `ta.tr(true)` accounts for gaps, so session breaks do not distort the ATR ruler |
 | You want pure trend behaviour | set weights 3/6 to 0, raise *Trend slope* weight |
-| You distrust the higher timeframe | set *HTF mode* to `Off`; the weight is removed from the denominator and the score stays on the same scale |
+| You distrust the higher timeframe | set *HTF mode* to `Off` (or weight 7 to 0); the weight leaves the denominator, the score stays on the same scale, and no `request.security` call is issued at all |
+| Structure keeps gating entries you want | lower *Structure memory*; the state now expires at that age instead of biasing the score forever |
 
 Changing the *Auto multiple* from 4 changes the HTF for every chart at once:
 4 gives 5m→20m, 1h→4h, 1D→4D.
+
+---
+
+## Backtesting the strategy honestly
+
+The strategy's order layer is where backtests usually lie. What it does, and what
+it cannot fix:
+
+* Fills land on the **next bar's open**. No `process_orders_on_close`.
+* Commission (0.03%) and 1-tick slippage are on by **default**.
+* `margin_long`/`margin_short` are 100 and size is capped by *Max position
+  notional*, so a tight stop cannot silently buy many times equity.
+* The protective stop is submitted in the same block as the entry, so a position
+  is never naked for its first bar.
+* Stops only ever tighten. A close beyond the stop exits at market rather than
+  moving the stop to meet price.
+* Scale-outs are **absolute thirds** of the entry quantity and each leg is latched
+  once it trades, so a filled target is never re-submitted behind the market.
+* **Not fixable:** size is computed from the signal bar's close but fills at the
+  next bar's open. On a gap the realised risk differs from the configured
+  percentage. R is recomputed from the actual fill so the reported figures stay
+  true, but the sizing itself cannot see the gap without lookahead.
 
 ---
 

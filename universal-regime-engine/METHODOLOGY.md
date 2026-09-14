@@ -112,14 +112,23 @@ An outside bar can break both sides in the same bar; that is resolved by where
 the bar closed, so the state is never ambiguous.
 
 ```
-age   = bar_index − bar of last break
-fade  = max(0.25, 1 − age / structMem)
-bias₅ = direction · fade
+age    = bar_index − bar of last break
+live   = age ≤ structMem
+fade   = live ? clamp(1 − age / structMem, 0, 1) : 0
+bias₅  = (live ? direction : 0) · fade
 ```
 
-**Why decay.** A break of structure three bars ago is strong evidence; the same
-break fifty bars ago, with nothing since, is stale. The floor of 0.25 keeps some
-memory rather than dropping to zero.
+**Why decay, and why it expires.** A break of structure three bars ago is strong
+evidence; the same break fifty bars ago, with nothing since, is stale. The fade
+runs linearly to zero and the state then **expires** — both the score contribution
+and the directional entry gate return to neutral.
+
+An earlier version floored the fade at 0.25 and never expired the direction. That
+made `structMem` a misnomer: a break thousands of bars old still put a permanent
+±5-point bias on the score at the default weight, and `structDir` never returning
+to 0 meant the structure gate blocked one side of every entry indefinitely, even
+across a year of flat price. The panel now shows `expired` for a structure that has
+aged out, so the distinction is visible rather than implied.
 
 ### F6 — Volume flow, with graceful degradation
 
@@ -142,11 +151,18 @@ The same slope + displacement core, evaluated on a higher timeframe:
 htf_bias = 0.6·clamp(slopeATR_htf / slopeNorm) + 0.4·clamp(distATR_htf / distNorm)
 ```
 
-The timeframe is **derived from the chart**: `chart_seconds × htfMult`, converted
-to a valid timeframe string (seconds → minutes → days → weeks → months). With the
-default multiple of 4: 5m→20m, 1h→4h, 1D→4D, 1W→1M. Fetched with
-`lookahead = barmerge.lookahead_off` and, by default, read one HTF bar back so
-only *closed* higher-timeframe data is ever used.
+The timeframe is **derived from the chart**: `timeframe.from_seconds(chart_seconds
+× htfMult)`. The built-in is used rather than a hand-rolled converter because it is
+guaranteed to return a resolution `request.security()` accepts — a hand-rolled one
+can emit `"3S"` (not a supported second resolution, so the request errors or snaps
+elsewhere) or mis-round at the week/month boundary. With the default multiple of 4:
+5m→20m, 1h→4h, 1D→4D.
+
+Fetched with `lookahead = barmerge.lookahead_off` and, by default, read one HTF bar
+back so only *closed* higher-timeframe data is ever used. The call is **guarded**:
+with HTF mode off, or weight 7 at zero, no request is issued at all, so turning the
+factor off genuinely costs nothing and does not consume one of TradingView's 40
+`request.*` slots.
 
 ---
 
@@ -215,7 +231,7 @@ directional score from before it coiled; the squeeze is the more urgent fact.
 | Playbook | Trigger |
 | --- | --- |
 | Continuation | `score` crosses ±entry threshold |
-| Reversion | `score` crosses back out of the far extreme **and** the last 5 bars contained a displacement of at least `mrStretch` ATR in that direction |
+| Reversion | `score` crosses back out of the far extreme **and** the last `mrLook` bars (default 5) contained a displacement of at least `mrStretch` ATR in that direction. Setting `mrStretch` to 0 removes the requirement — documented in the input's tooltip, because the gate then silently passes almost every bar |
 | Breakout | the squeeze releases (`squeeze[1] and not squeeze`) with `\|score\| > 0.5·threshold` and price on the right side of the basis |
 
 The prior-stretch requirement on reversion is what stops it from firing on every
@@ -255,6 +271,25 @@ point value yourself.
 
 ---
 
+## 6b. Setup invalidation
+
+A setup ends for one of three reasons, and the panel names which:
+
+| Cause | Test |
+| --- | --- |
+| `stopped out` | long and `low ≤ stop`, or short and `high ≥ stop` |
+| `target 3 reached` | long and `high ≥ T3`, or short and `low ≤ T3` |
+| `score faded` | `\|score\| < exitTh` |
+
+Only the third is visible to the score. A hard reversal can take the score from
++40 to −40 without ever passing through the stand-aside band, so without the first
+test the panel would keep advertising a long — with its original entry, stop and
+targets — long after price had traded through that stop. For a tool whose whole
+purpose is decision support, reporting an invalidated position is the worst kind of
+bug: it is silent, and it looks like information.
+
+---
+
 ## 7. Repainting analysis
 
 | Component | Behaviour |
@@ -264,6 +299,23 @@ point value yourself.
 | Score, regime, all seven factors | functions of closed data only. |
 | Signals | with *Only evaluate on closed bars* (default) emitted on bar close. Turn it off for faster, intrabar-mutable signals — disclosed by the setting name and shown in the panel's last row. |
 | Strategy orders | `calc_on_every_tick = false`, no `process_orders_on_close`. Fills land on the next bar's open. |
+
+---
+
+## 7b. Execution model (strategy only)
+
+The measurement engine is shared byte-for-byte with the indicator; everything below
+it differs. The order layer is where backtests usually lie, so each choice is stated:
+
+| Concern | Choice | Why |
+| --- | --- | --- |
+| Fill timing | next bar's open, `calc_on_every_tick = false`, no `process_orders_on_close` | filling at the close of the bar that produced the signal flatters results |
+| First-bar protection | `strategy.exit` is submitted in the **same block** as `strategy.entry` | gating it on `strategy.position_size != 0` places it only after the fill is visible, leaving the position with no stop for its entire first bar |
+| Stop movement | strictly monotonic — breakeven and Chandelier only ever tighten | an earlier version clamped the stop toward price when price closed through it, which ratcheted the stop down bar after bar and turned a 1R loss into an unbounded one. A close beyond the stop now exits at market instead |
+| Trailing inputs | `ta.highest`/`ta.lowest` are evaluated unconditionally at engine level | calling them inside `if in_position` advances their windows only on bars where a position is open, producing a trail built from the wrong lookback |
+| Scale-out | absolute thirds of the entry quantity, each leg latched once touched | `qty_percent` is a share of the position, so 33/50/remainder is 33/50/17, not thirds; and re-issuing a filled exit id re-creates it behind the market, shedding another slice every bar |
+| Leverage | `margin_long`/`margin_short` = 100, plus a "max position notional" cap | a very tight stop asks risk-based sizing for many times equity, and the emulator will happily fill it |
+| Sizing vs fill | size from the signal bar's close, R recomputed from the actual fill | not removable without lookahead. On a gap the realised risk differs from the configured percentage; recomputing R from the fill at least keeps the reported figures true |
 
 ---
 

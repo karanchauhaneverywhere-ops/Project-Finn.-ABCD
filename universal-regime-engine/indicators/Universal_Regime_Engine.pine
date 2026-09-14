@@ -92,6 +92,7 @@
 indicator("Universal Regime Engine [Finn]", shorttitle = "FURE", overlay = true,
      max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
 
+// >>>>> ENGINE BLOCK START — must stay byte-identical in indicator and strategy >>>>>
 // -----------------------------------------------------------------------------
 // 0 · INPUTS
 // -----------------------------------------------------------------------------
@@ -141,7 +142,8 @@ grpSig = "⑤ Signal engine"
 sigMode   = input.string("Auto (regime aware)", "Playbook", options = ["Auto (regime aware)", "Trend-following only", "Mean-reversion only", "Breakout only"], group = grpSig)
 entryTh   = input.float(35.0, "Entry |score| threshold", minval = 5, maxval = 95, step = 1, group = grpSig)
 exitTh    = input.float(10.0, "Flat / stand-aside |score|", minval = 0, maxval = 90, step = 1, group = grpSig)
-mrStretch = input.float(1.0, "Reversion needs prior stretch (ATR)", minval = 0, step = 0.25, group = grpSig)
+mrStretch = input.float(1.0, "Reversion needs prior stretch (ATR)", minval = 0, step = 0.25, group = grpSig, tooltip = "How far price must have been pushed away from its adaptive mean, within the lookback below, before a fade is allowed. Set to 0 to remove the requirement entirely — the reversion playbook then fires on any threshold cross.")
+mrLook    = input.int(5, "Reversion stretch lookback (bars)", minval = 1, group = grpSig)
 needStruct= input.bool(true, "Require market-structure agreement", group = grpSig)
 needHtf   = input.bool(true, "Require higher-timeframe agreement", group = grpSig)
 cooldown  = input.int(5, "Cooldown between signals (bars)", minval = 0, group = grpSig)
@@ -154,9 +156,7 @@ swingLB  = input.int(10, "Structure lookback for the stop (bars)", minval = 2, g
 rt1      = input.float(1.0, "Target 1 (R)", minval = 0.25, step = 0.25, group = grpRisk)
 rt2      = input.float(2.0, "Target 2 (R)", minval = 0.25, step = 0.25, group = grpRisk)
 rt3      = input.float(3.0, "Target 3 (R)", minval = 0.25, step = 0.25, group = grpRisk)
-acctSize = input.float(10000, "Account size (position-size hint)", minval = 0, group = grpRisk)
 riskPct  = input.float(1.0, "Risk per trade %", minval = 0.01, step = 0.05, group = grpRisk)
-projBars = input.int(30, "Project levels forward (bars)", minval = 5, group = grpRisk)
 
 grpVis = "⑦ Visuals"
 showMA     = input.bool(true, "Adaptive MA + envelope", group = grpVis)
@@ -192,22 +192,6 @@ f_kama(source, erWin, fastN, slowN) =>
     out := na(out) ? source : out + sc * (source - out)
     out
 
-// Seconds -> a timeframe string TradingView accepts, so the HTF can be derived
-// from whatever chart the user happens to open.
-f_tfString(secs) =>
-    string r = "D"
-    if secs < 60
-        r := str.tostring(math.max(1, math.round(secs)), "#") + "S"
-    else if secs < 86400
-        r := str.tostring(math.max(1, math.round(secs / 60.0)), "#")
-    else if secs < 604800
-        r := str.tostring(math.max(1, math.round(secs / 86400.0)), "#") + "D"
-    else if secs < 2419200
-        r := str.tostring(math.max(1, math.round(secs / 604800.0)), "#") + "W"
-    else
-        r := str.tostring(math.max(1, math.round(secs / 2592000.0)), "#") + "M"
-    r
-
 // Text gauge for the panel: -1 .. +1  ->  "◄███··" / "►███··"
 f_gauge(v) =>
     float c = f_clamp(v, -1.0, 1.0)
@@ -220,10 +204,10 @@ f_gauge(v) =>
 // The slope+displacement core, isolated so the SAME maths can be evaluated in a
 // higher-timeframe context by request.security.
 f_biasCore() =>
-    float k  = f_kama(close, erLen, kFast, kSlow)
+    float k  = f_kama(src, erLen, kFast, kSlow)
     float a  = ta.atr(atrLen)
     float sl = a > 0 ? (k - k[slopeLen]) / a : 0.0
-    float ds = a > 0 ? (close - k) / a : 0.0
+    float ds = a > 0 ? (src - k) / a : 0.0
     0.6 * f_clamp(sl / slopeNorm, -1.0, 1.0) + 0.4 * f_clamp(ds / distNorm, -1.0, 1.0)
 
 f_htfPacket(sh) =>
@@ -307,8 +291,15 @@ if bosDn
     structBar := bar_index
     structLvl := lastPL
 
-float structFade = na(structBar) ? 0.0 : math.max(0.25, 1.0 - (bar_index - structBar) * 1.0 / (structMem * 1.0))
-float sStruct    = structDir * structFade
+// The fade runs linearly to zero over structMem bars and the state then EXPIRES:
+// both the score contribution and the directional gate return to neutral. Without
+// the expiry, "memory" was a misnomer — a break 3000 bars old still biased the
+// score and still blocked one side of every entry.
+float structAge    = na(structBar) ? na : (bar_index - structBar) * 1.0
+bool  structLive   = not na(structAge) and structAge <= structMem
+float structFade   = structLive ? f_clamp(1.0 - structAge / (structMem * 1.0), 0.0, 1.0) : 0.0
+int   structEff    = structLive ? structDir : 0
+float sStruct      = structEff * structFade
 
 // -----------------------------------------------------------------------------
 // 7 · FACTOR 6 — volume flow, with graceful degradation
@@ -324,10 +315,15 @@ float sFlow    = volUsable ? f_clamp((nz(mfi, 50.0) - 50.0) / 25.0, -1.0, 1.0) :
 // -----------------------------------------------------------------------------
 // 8 · FACTOR 7 — higher-timeframe bias (derived from the chart timeframe)
 // -----------------------------------------------------------------------------
-bool   htfOn  = htfMode != "Off"
-string htfRes = htfMode == "Manual" ? htfManual : f_tfString(timeframe.in_seconds(timeframe.period) * htfMult * 1.0)
+// timeframe.from_seconds() is used rather than a hand-rolled converter because it
+// is guaranteed to return a resolution request.security() accepts. A hand-rolled
+// one can emit "3S" or "17W", which either error or snap to something else.
+bool   htfOn  = htfMode != "Off" and wHtf > 0
+string htfRes = htfMode == "Manual" ? htfManual : timeframe.from_seconds(timeframe.in_seconds(timeframe.period) * htfMult)
 int    htfShift = htfStrict ? 1 : 0
-float  htfRaw = request.security(syminfo.tickerid, htfRes, f_htfPacket(htfShift), lookahead = barmerge.lookahead_off)
+// Guarded so that turning the higher timeframe off actually costs nothing — an
+// unconditional call still consumes one of TradingView's 40 security slots.
+float  htfRaw = htfOn ? request.security(syminfo.tickerid, htfRes, f_htfPacket(htfShift), lookahead = barmerge.lookahead_off) : na
 float  sHtf   = htfOn ? f_clamp(nz(htfRaw), -1.0, 1.0) : 0.0
 
 // -----------------------------------------------------------------------------
@@ -399,8 +395,8 @@ barsInRegime := regime == regime[1] ? barsInRegime + 1 : 0
 bool tfL = ta.crossover(score, entryTh)
 bool tfS = ta.crossunder(score, -entryTh)
 // B · reversion — score climbs back out of an extreme AFTER a stretched move
-bool mrL = ta.crossover(score, -entryTh)  and ta.lowest(distATR, 5)  <= -mrStretch
-bool mrS = ta.crossunder(score, entryTh)  and ta.highest(distATR, 5) >=  mrStretch
+bool mrL = ta.crossover(score, -entryTh)  and ta.lowest(distATR, mrLook)  <= -mrStretch
+bool mrS = ta.crossunder(score, entryTh)  and ta.highest(distATR, mrLook) >=  mrStretch
 // C · breakout — the squeeze releases with the score already leaning
 bool brL = expansion and score >  entryTh * 0.5 and close > basis
 bool brS = expansion and score < -entryTh * 0.5 and close < basis
@@ -419,8 +415,8 @@ bool baseS = switch sigMode
 
 // Gates
 bool barOk     = closedOnly ? barstate.isconfirmed : true
-bool structOkL = not needStruct or structDir >= 0
-bool structOkS = not needStruct or structDir <= 0
+bool structOkL = not needStruct or structEff >= 0
+bool structOkS = not needStruct or structEff <= 0
 bool htfOkL    = not needHtf or not htfOn or sHtf > 0
 bool htfOkS    = not needHtf or not htfOn or sHtf < 0
 
@@ -485,9 +481,48 @@ if shortSig
     eT2 := eEntry - rt2 * rUnitS
     eT3 := eEntry - rt3 * rUnitS
 
+// -----------------------------------------------------------------------------
+// 12b · SETUP INVALIDATION
+//      A setup ends for one of three reasons, and the panel must say which.
+//      Price trading through the stop is the one the score cannot detect: it can
+//      swing from +40 to -40 without ever crossing the stand-aside band.
+// -----------------------------------------------------------------------------
+// `not (longSig or shortSig)` keeps a setup from being invalidated by the very bar
+// that created it: with a pure-ATR stop, any bar wider than atrStop x ATR would
+// otherwise trip its own stop test the instant it fired.
+bool freshSig     = longSig or shortSig
+bool stopBreached = stance != 0 and not freshSig and not na(eStop) and (stance > 0 ? low  <= eStop : high >= eStop)
+bool targetDone   = stance != 0 and not freshSig and not na(eT3)  and (stance > 0 ? high >= eT3   : low  <= eT3)
+
+if stopBreached or targetDone
+    stance := 0
+
+var string setupState = "none"
+if longSig or shortSig
+    setupState := "live"
+else if stopBreached
+    setupState := "stopped out"
+else if targetDone
+    setupState := "target 3 reached"
+else if standDown
+    setupState := "score faded"
+
 float riskPerUnit = na(eEntry) ? na : math.abs(eEntry - eStop)
 float riskATR     = na(riskPerUnit) or atr <= 0 ? na : riskPerUnit / atr
-float sizeUnits   = na(riskPerUnit) or riskPerUnit <= 0 ? na : acctSize * riskPct / 100.0 / riskPerUnit
+// <<<<< ENGINE BLOCK END <<<<<
+
+// -----------------------------------------------------------------------------
+// 12c · PRESENTATION LAYER  (indicator only — NOT part of the shared engine)
+//       The strategy defines its own sizeUnits/sizeLabel/sizeRisk from real
+//       strategy equity, so the panel never shows a number the script does not
+//       actually use.
+// -----------------------------------------------------------------------------
+acctSize = input.float(10000, "Account size (position-size hint)", minval = 0, group = grpRisk)
+projBars = input.int(30, "Project levels forward (bars)", minval = 5, group = grpRisk)
+
+float  sizeUnits = na(riskPerUnit) or riskPerUnit <= 0 ? na : acctSize * riskPct / 100.0 / riskPerUnit
+string sizeLabel = "Size @ " + str.tostring(riskPct, "#.##") + "% of " + str.tostring(acctSize, "#")
+string sizeRisk  = na(riskPerUnit) ? "—" : str.tostring(acctSize * riskPct / 100.0, "#.##")
 
 // -----------------------------------------------------------------------------
 // 13 · VISUALS
@@ -513,6 +548,7 @@ if showStruct and (bosUp or bosDn)
 plotshape(showSig and longSig,  "Long signal",  shape.triangleup,   location.belowbar, color = cBull, size = size.small, text = "LONG")
 plotshape(showSig and shortSig, "Short signal", shape.triangledown, location.abovebar, color = cBear, size = size.small, text = "SHORT")
 plotshape(showSig and standDown, "Stand aside", shape.xcross, location.top, color = cNeut, size = size.tiny)
+plotshape(showSig and stopBreached, "Setup invalidated", shape.xcross, location.bottom, color = cBear, size = size.tiny)
 
 var line lnStop = na
 var line lnEnt  = na
@@ -598,7 +634,7 @@ if showPanel and barstate.islast
          str.tostring(distATR, "#.##") + " atr",
          str.tostring(rsi, "#.#"),
          str.tostring(adxVal, "#.#") + " adx",
-         structDir > 0 ? "bullish" : structDir < 0 ? "bearish" : "none",
+         structEff > 0 ? "bullish" : structEff < 0 ? "bearish" : structDir != 0 ? "expired" : "none",
          volUsable ? str.tostring(mfi, "#.#") : "n/a",
          htfOn ? str.tostring(sHtf, "#.##") : "off")
     array<float>  fBias = array.from(sTrend, sDist, sMom, sAdx, sStruct, sFlow, sHtf)
@@ -621,11 +657,11 @@ if showPanel and barstate.islast
     f_row(dash, 16, "Volume feed", volUsable ? "usable" : "absent → factor dropped", "", "", "", volUsable ? cTxt : cDim, cPanel)
 
     f_row(dash, 17, "ACTIVE SETUP", "", "", "", "", cTxt, cHdr)
-    f_row(dash, 18, "Stance", stance > 0 ? "LONG" : stance < 0 ? "SHORT" : "flat", "", "since", na(eEntry) ? "—" : str.tostring(bar_index - lastSigBar) + "b", stance > 0 ? cBull : stance < 0 ? cBear : cDim, cPanel)
+    f_row(dash, 18, "Stance", stance > 0 ? "LONG" : stance < 0 ? "SHORT" : "flat", setupState, "since", na(eEntry) ? "—" : str.tostring(bar_index - lastSigBar) + "b", stance > 0 ? cBull : stance < 0 ? cBear : cDim, cPanel)
     f_row(dash, 19, "Entry", na(eEntry) ? "—" : str.tostring(eEntry, format.mintick), "", "", "", cTxt, cPanel)
     f_row(dash, 20, "Stop", na(eStop) ? "—" : str.tostring(eStop, format.mintick), "", "atr", na(riskATR) ? "—" : str.tostring(riskATR, "#.##"), cBear, cPanel)
     f_row(dash, 21, "Targets 1 / 2 / 3", na(eT1) ? "—" : str.tostring(eT1, format.mintick) + " / " + str.tostring(eT2, format.mintick) + " / " + str.tostring(eT3, format.mintick), "", "R", str.tostring(rt1, "#.#") + "/" + str.tostring(rt2, "#.#") + "/" + str.tostring(rt3, "#.#"), cBull, cPanel)
-    f_row(dash, 22, "Size @ " + str.tostring(riskPct, "#.##") + "% risk", na(sizeUnits) ? "—" : str.tostring(sizeUnits, "#.####") + " units", "", "risk", na(riskPerUnit) ? "—" : str.tostring(acctSize * riskPct / 100.0, "#.##"), cTxt, cPanel)
+    f_row(dash, 22, sizeLabel, na(sizeUnits) ? "—" : str.tostring(sizeUnits, "#.####") + " units", "", "risk", sizeRisk, cTxt, cPanel)
     f_row(dash, 23, closedOnly ? "Closed-bar signals" : "Intrabar signals (mutable)", htfStrict ? "HTF: closed bar" : "HTF: live bar", "", "", "", cDim, cPanel)
 
 // -----------------------------------------------------------------------------

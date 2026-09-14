@@ -25,10 +25,15 @@
 //     backtest and the live chart agree.
 //   * Commission (0.03%) and 1-tick slippage are on by DEFAULT. Turn them up for
 //     illiquid symbols. A strategy that only works at zero cost does not work.
-//   * Scale-outs use qty_percent, which is a percent of the position remaining
-//     at that moment: 33% then 50% of the rest then the remainder ≈ three equal
-//     thirds. Intrabar fill order between stop and target is unknowable from
-//     bar data, so multi-target results on high timeframes are approximations.
+//   * Scale-outs use ABSOLUTE thirds of the entry quantity, not qty_percent, and
+//     each leg is latched so a filled target is never re-submitted. Intrabar fill
+//     order between stop and target is still unknowable from bar data, so
+//     multi-target results on high timeframes remain approximations.
+//   * margin_long/short are set to 100 and size is capped by "Max position
+//     notional", so the emulator cannot fill a position no real account could hold.
+//   * Size is computed from the signal bar's close but fills at the next bar's
+//     open. On a gap the realised risk differs from the configured percentage;
+//     the R figures are recomputed from the actual fill so they stay honest.
 //   * There is no optimisation loop, no walk-forward and no curve-fit default.
 //     The defaults are round numbers chosen because they are standard, not
 //     because they maximised a past P&L.
@@ -45,9 +50,12 @@ strategy("Universal Regime Engine Strategy [Finn]", shorttitle = "FURE-S", overl
      slippage               = 1,
      pyramiding             = 0,
      calc_on_every_tick     = false,
+     margin_long            = 100,
+     margin_short           = 100,
      max_labels_count       = 500,
      max_lines_count        = 500)
 
+// >>>>> ENGINE BLOCK START — must stay byte-identical in indicator and strategy >>>>>
 // -----------------------------------------------------------------------------
 // 0 · INPUTS
 // -----------------------------------------------------------------------------
@@ -97,7 +105,8 @@ grpSig = "⑤ Signal engine"
 sigMode   = input.string("Auto (regime aware)", "Playbook", options = ["Auto (regime aware)", "Trend-following only", "Mean-reversion only", "Breakout only"], group = grpSig)
 entryTh   = input.float(35.0, "Entry |score| threshold", minval = 5, maxval = 95, step = 1, group = grpSig)
 exitTh    = input.float(10.0, "Flat / stand-aside |score|", minval = 0, maxval = 90, step = 1, group = grpSig)
-mrStretch = input.float(1.0, "Reversion needs prior stretch (ATR)", minval = 0, step = 0.25, group = grpSig)
+mrStretch = input.float(1.0, "Reversion needs prior stretch (ATR)", minval = 0, step = 0.25, group = grpSig, tooltip = "How far price must have been pushed away from its adaptive mean, within the lookback below, before a fade is allowed. Set to 0 to remove the requirement entirely — the reversion playbook then fires on any threshold cross.")
+mrLook    = input.int(5, "Reversion stretch lookback (bars)", minval = 1, group = grpSig)
 needStruct= input.bool(true, "Require market-structure agreement", group = grpSig)
 needHtf   = input.bool(true, "Require higher-timeframe agreement", group = grpSig)
 cooldown  = input.int(5, "Cooldown between signals (bars)", minval = 0, group = grpSig)
@@ -110,9 +119,7 @@ swingLB  = input.int(10, "Structure lookback for the stop (bars)", minval = 2, g
 rt1      = input.float(1.0, "Target 1 (R)", minval = 0.25, step = 0.25, group = grpRisk)
 rt2      = input.float(2.0, "Target 2 (R)", minval = 0.25, step = 0.25, group = grpRisk)
 rt3      = input.float(3.0, "Target 3 (R)", minval = 0.25, step = 0.25, group = grpRisk)
-acctSize = input.float(10000, "Account size (position-size hint)", minval = 0, group = grpRisk)
 riskPct  = input.float(1.0, "Risk per trade %", minval = 0.01, step = 0.05, group = grpRisk)
-projBars = input.int(30, "Project levels forward (bars)", minval = 5, group = grpRisk)
 
 grpVis = "⑦ Visuals"
 showMA     = input.bool(true, "Adaptive MA + envelope", group = grpVis)
@@ -148,22 +155,6 @@ f_kama(source, erWin, fastN, slowN) =>
     out := na(out) ? source : out + sc * (source - out)
     out
 
-// Seconds -> a timeframe string TradingView accepts, so the HTF can be derived
-// from whatever chart the user happens to open.
-f_tfString(secs) =>
-    string r = "D"
-    if secs < 60
-        r := str.tostring(math.max(1, math.round(secs)), "#") + "S"
-    else if secs < 86400
-        r := str.tostring(math.max(1, math.round(secs / 60.0)), "#")
-    else if secs < 604800
-        r := str.tostring(math.max(1, math.round(secs / 86400.0)), "#") + "D"
-    else if secs < 2419200
-        r := str.tostring(math.max(1, math.round(secs / 604800.0)), "#") + "W"
-    else
-        r := str.tostring(math.max(1, math.round(secs / 2592000.0)), "#") + "M"
-    r
-
 // Text gauge for the panel: -1 .. +1  ->  "◄███··" / "►███··"
 f_gauge(v) =>
     float c = f_clamp(v, -1.0, 1.0)
@@ -176,10 +167,10 @@ f_gauge(v) =>
 // The slope+displacement core, isolated so the SAME maths can be evaluated in a
 // higher-timeframe context by request.security.
 f_biasCore() =>
-    float k  = f_kama(close, erLen, kFast, kSlow)
+    float k  = f_kama(src, erLen, kFast, kSlow)
     float a  = ta.atr(atrLen)
     float sl = a > 0 ? (k - k[slopeLen]) / a : 0.0
-    float ds = a > 0 ? (close - k) / a : 0.0
+    float ds = a > 0 ? (src - k) / a : 0.0
     0.6 * f_clamp(sl / slopeNorm, -1.0, 1.0) + 0.4 * f_clamp(ds / distNorm, -1.0, 1.0)
 
 f_htfPacket(sh) =>
@@ -263,8 +254,15 @@ if bosDn
     structBar := bar_index
     structLvl := lastPL
 
-float structFade = na(structBar) ? 0.0 : math.max(0.25, 1.0 - (bar_index - structBar) * 1.0 / (structMem * 1.0))
-float sStruct    = structDir * structFade
+// The fade runs linearly to zero over structMem bars and the state then EXPIRES:
+// both the score contribution and the directional gate return to neutral. Without
+// the expiry, "memory" was a misnomer — a break 3000 bars old still biased the
+// score and still blocked one side of every entry.
+float structAge    = na(structBar) ? na : (bar_index - structBar) * 1.0
+bool  structLive   = not na(structAge) and structAge <= structMem
+float structFade   = structLive ? f_clamp(1.0 - structAge / (structMem * 1.0), 0.0, 1.0) : 0.0
+int   structEff    = structLive ? structDir : 0
+float sStruct      = structEff * structFade
 
 // -----------------------------------------------------------------------------
 // 7 · FACTOR 6 — volume flow, with graceful degradation
@@ -280,10 +278,15 @@ float sFlow    = volUsable ? f_clamp((nz(mfi, 50.0) - 50.0) / 25.0, -1.0, 1.0) :
 // -----------------------------------------------------------------------------
 // 8 · FACTOR 7 — higher-timeframe bias (derived from the chart timeframe)
 // -----------------------------------------------------------------------------
-bool   htfOn  = htfMode != "Off"
-string htfRes = htfMode == "Manual" ? htfManual : f_tfString(timeframe.in_seconds(timeframe.period) * htfMult * 1.0)
+// timeframe.from_seconds() is used rather than a hand-rolled converter because it
+// is guaranteed to return a resolution request.security() accepts. A hand-rolled
+// one can emit "3S" or "17W", which either error or snap to something else.
+bool   htfOn  = htfMode != "Off" and wHtf > 0
+string htfRes = htfMode == "Manual" ? htfManual : timeframe.from_seconds(timeframe.in_seconds(timeframe.period) * htfMult)
 int    htfShift = htfStrict ? 1 : 0
-float  htfRaw = request.security(syminfo.tickerid, htfRes, f_htfPacket(htfShift), lookahead = barmerge.lookahead_off)
+// Guarded so that turning the higher timeframe off actually costs nothing — an
+// unconditional call still consumes one of TradingView's 40 security slots.
+float  htfRaw = htfOn ? request.security(syminfo.tickerid, htfRes, f_htfPacket(htfShift), lookahead = barmerge.lookahead_off) : na
 float  sHtf   = htfOn ? f_clamp(nz(htfRaw), -1.0, 1.0) : 0.0
 
 // -----------------------------------------------------------------------------
@@ -355,8 +358,8 @@ barsInRegime := regime == regime[1] ? barsInRegime + 1 : 0
 bool tfL = ta.crossover(score, entryTh)
 bool tfS = ta.crossunder(score, -entryTh)
 // B · reversion — score climbs back out of an extreme AFTER a stretched move
-bool mrL = ta.crossover(score, -entryTh)  and ta.lowest(distATR, 5)  <= -mrStretch
-bool mrS = ta.crossunder(score, entryTh)  and ta.highest(distATR, 5) >=  mrStretch
+bool mrL = ta.crossover(score, -entryTh)  and ta.lowest(distATR, mrLook)  <= -mrStretch
+bool mrS = ta.crossunder(score, entryTh)  and ta.highest(distATR, mrLook) >=  mrStretch
 // C · breakout — the squeeze releases with the score already leaning
 bool brL = expansion and score >  entryTh * 0.5 and close > basis
 bool brS = expansion and score < -entryTh * 0.5 and close < basis
@@ -375,8 +378,8 @@ bool baseS = switch sigMode
 
 // Gates
 bool barOk     = closedOnly ? barstate.isconfirmed : true
-bool structOkL = not needStruct or structDir >= 0
-bool structOkS = not needStruct or structDir <= 0
+bool structOkL = not needStruct or structEff >= 0
+bool structOkS = not needStruct or structEff <= 0
 bool htfOkL    = not needHtf or not htfOn or sHtf > 0
 bool htfOkS    = not needHtf or not htfOn or sHtf < 0
 
@@ -441,9 +444,35 @@ if shortSig
     eT2 := eEntry - rt2 * rUnitS
     eT3 := eEntry - rt3 * rUnitS
 
+// -----------------------------------------------------------------------------
+// 12b · SETUP INVALIDATION
+//      A setup ends for one of three reasons, and the panel must say which.
+//      Price trading through the stop is the one the score cannot detect: it can
+//      swing from +40 to -40 without ever crossing the stand-aside band.
+// -----------------------------------------------------------------------------
+// `not (longSig or shortSig)` keeps a setup from being invalidated by the very bar
+// that created it: with a pure-ATR stop, any bar wider than atrStop x ATR would
+// otherwise trip its own stop test the instant it fired.
+bool freshSig     = longSig or shortSig
+bool stopBreached = stance != 0 and not freshSig and not na(eStop) and (stance > 0 ? low  <= eStop : high >= eStop)
+bool targetDone   = stance != 0 and not freshSig and not na(eT3)  and (stance > 0 ? high >= eT3   : low  <= eT3)
+
+if stopBreached or targetDone
+    stance := 0
+
+var string setupState = "none"
+if longSig or shortSig
+    setupState := "live"
+else if stopBreached
+    setupState := "stopped out"
+else if targetDone
+    setupState := "target 3 reached"
+else if standDown
+    setupState := "score faded"
+
 float riskPerUnit = na(eEntry) ? na : math.abs(eEntry - eStop)
 float riskATR     = na(riskPerUnit) or atr <= 0 ? na : riskPerUnit / atr
-float sizeUnits   = na(riskPerUnit) or riskPerUnit <= 0 ? na : acctSize * riskPct / 100.0 / riskPerUnit
+// <<<<< ENGINE BLOCK END <<<<<
 
 // -----------------------------------------------------------------------------
 // 13 · EXECUTION
@@ -453,7 +482,8 @@ tradeDir   = input.string("Both", "Direction", options = ["Both", "Long only", "
 sizeMode   = input.string("Risk % of equity", "Position sizing", options = ["Risk % of equity", "Percent of equity", "Fixed contracts"], group = grpBT, tooltip = "Risk % of equity sizes every trade off the distance to its own stop, which is what makes one setting behave the same on any instrument.")
 fixedQty   = input.float(1.0, "Fixed contracts", minval = 0.000001, group = grpBT)
 eqPct      = input.float(10.0, "Percent of equity", minval = 0.1, maxval = 100, group = grpBT)
-useTargets = input.bool(true, "Scale out at T1 / T2 / T3", group = grpBT)
+maxNotPct  = input.float(100.0, "Max position notional (% of equity)", minval = 1, maxval = 1000, step = 5, group = grpBT, tooltip = "Hard cap on size. Without it a very tight stop asks risk-based sizing for many times equity — the emulator fills it, and the equity curve then reflects leverage no real account could carry.")
+useTargets = input.bool(true, "Scale out in thirds at T1 / T2 / T3", group = grpBT)
 useTrail   = input.bool(true, "Trail the remainder (Chandelier)", group = grpBT)
 trailMult  = input.float(2.5, "Trail ATR multiple", minval = 0.5, step = 0.1, group = grpBT)
 beAtR      = input.float(1.0, "Move stop to breakeven at (R)  ·  0 = off", minval = 0, step = 0.25, group = grpBT)
@@ -462,8 +492,19 @@ allowFlip  = input.bool(true, "Reverse on an opposite signal", group = grpBT)
 fromDate   = input.time(timestamp("1 Jan 2015 00:00 +0000"), "Backtest from", group = grpBT)
 toDate     = input.time(timestamp("1 Jan 2100 00:00 +0000"), "Backtest to", group = grpBT)
 
+// Presentation figures for the shared panel, computed from REAL strategy equity so
+// the panel can never advertise a size the script does not actually trade.
+float  sizeUnits = na(riskPerUnit) or riskPerUnit <= 0 ? na : strategy.equity * riskPct / 100.0 / riskPerUnit
+string sizeLabel = "Size @ " + str.tostring(riskPct, "#.##") + "% of equity"
+string sizeRisk  = na(riskPerUnit) ? "—" : str.tostring(strategy.equity * riskPct / 100.0, "#.##")
+
 // Position size. Risk-based sizing is the default because it is the only mode
 // whose meaning does not change when you switch instrument.
+//
+// CAVEAT, stated because it is not removable: sizing is computed from the SIGNAL
+// bar's close while the order fills at the NEXT bar's open. On a gap the realised
+// risk differs from the configured percentage. rUnit0 below is recomputed from the
+// actual fill, so the R figures the panel reports stay true even when that happens.
 f_qty(entryPx, stopPx) =>
     float q = na
     if sizeMode == "Fixed contracts"
@@ -473,14 +514,17 @@ f_qty(entryPx, stopPx) =>
     else
         float rpu = math.abs(entryPx - stopPx)
         q := rpu > 0 ? strategy.equity * riskPct / 100.0 / rpu : na
-    q
+    float cap = entryPx > 0 ? strategy.equity * maxNotPct / 100.0 / entryPx : na
+    na(q) or na(cap) ? q : math.min(q, cap)
 
-bool inWindow = time >= fromDate and time <= toDate
-bool allowL   = tradeDir != "Short only"
-bool allowS   = tradeDir != "Long only"
+bool inWindow   = time >= fromDate and time <= toDate
+bool allowL     = tradeDir != "Short only"
+bool allowS     = tradeDir != "Long only"
+// Without a usable ATR there is no stop and therefore no way to size the trade.
+bool tradableBar = not na(atr) and atr > 0
 
-bool goLong  = longSig  and allowL and inWindow
-bool goShort = shortSig and allowS and inWindow
+bool goLong  = longSig  and allowL and inWindow and tradableBar
+bool goShort = shortSig and allowS and inWindow and tradableBar
 
 bool openL = goLong  and (strategy.position_size == 0 or (strategy.position_size < 0 and allowFlip))
 bool openS = goShort and (strategy.position_size == 0 or (strategy.position_size > 0 and allowFlip))
@@ -488,73 +532,144 @@ bool openS = goShort and (strategy.position_size == 0 or (strategy.position_size
 float qL = nz(f_qty(close, stopL), 0.0)
 float qS = nz(f_qty(close, stopS), 0.0)
 
-if openL and qL > 0
-    strategy.entry("L", strategy.long, qty = qL, comment = "score " + str.tostring(score, "#"))
-if openS and qS > 0
-    strategy.entry("S", strategy.short, qty = qS, comment = "score " + str.tostring(score, "#"))
-
-// Live trade state. rUnit0 is frozen at entry so that "R" keeps meaning the
-// risk that was actually taken, even after the stop is trailed or moved to BE.
+// Live trade state. rUnit0 is frozen at the fill so that "R" keeps meaning the risk
+// actually taken, even after the stop is trailed or moved to breakeven.
 var float curEntry = na
 var float curStop  = na
 var float rUnit0   = na
+var float posQty   = na
 var int   curDir   = 0
+var bool  tookT1   = false
+var bool  tookT2   = false
+var float prevPos  = 0.0
 
-if strategy.position_size > 0 and curDir <= 0
+// --- open ------------------------------------------------------------------
+// The protective exit MUST be submitted in the same block as the entry. Gating it
+// on `strategy.position_size != 0` (the obvious way) means the exit is only placed
+// after the fill is visible, leaving the position naked for its whole first bar —
+// an uncapped loss on any reversal or gap. Pine attaches an exit to a pending entry
+// and activates it the moment that entry fills.
+if openL and qL > 0
+    strategy.entry("L", strategy.long, qty = qL, comment = "score " + str.tostring(score, "#"))
+    curDir   := 1
+    curEntry := close
+    curStop  := stopL
+    rUnit0   := close - stopL
+    posQty   := qL
+    tookT1   := false
+    tookT2   := false
+if openS and qS > 0
+    strategy.entry("S", strategy.short, qty = qS, comment = "score " + str.tostring(score, "#"))
+    curDir   := -1
+    curEntry := close
+    curStop  := stopS
+    rUnit0   := stopS - close
+    posQty   := qS
+    tookT1   := false
+    tookT2   := false
+
+// --- reconcile with the real fill ------------------------------------------
+bool justOpenedL = strategy.position_size > 0 and prevPos <= 0
+bool justOpenedS = strategy.position_size < 0 and prevPos >= 0
+bool justFlat    = strategy.position_size == 0 and prevPos != 0
+
+if justOpenedL
     curDir   := 1
     curEntry := strategy.position_avg_price
-    curStop  := na(eStop) or eStop >= curEntry ? curEntry - atrStop * atr : eStop
+    curStop  := na(curStop) or curStop >= curEntry ? curEntry - atrStop * atr : curStop
     rUnit0   := curEntry - curStop
-if strategy.position_size < 0 and curDir >= 0
+    posQty   := math.abs(strategy.position_size)
+if justOpenedS
     curDir   := -1
     curEntry := strategy.position_avg_price
-    curStop  := na(eStop) or eStop <= curEntry ? curEntry + atrStop * atr : eStop
+    curStop  := na(curStop) or curStop <= curEntry ? curEntry + atrStop * atr : curStop
     rUnit0   := curStop - curEntry
-if strategy.position_size == 0
+    posQty   := math.abs(strategy.position_size)
+if justFlat
     curDir   := 0
     curEntry := na
     curStop  := na
     rUnit0   := na
+    posQty   := na
 
-// Breakeven, then trail — both monotonic, a stop is never loosened.
+// --- breakeven and trail ----------------------------------------------------
+// swingHi / swingLo come from the engine, where ta.highest / ta.lowest are evaluated
+// on EVERY bar. Calling those functions here, inside `if curDir != 0`, would advance
+// their windows only on bars where a position is open, so the trail would be built
+// from the highest high of "the last N bars this trade existed" rather than the last
+// N bars — far too tight for the first N bars of every trade.
+//
+// Both updates are strictly monotonic: a stop is never loosened. The previous
+// version clamped the stop toward price whenever price closed through it, which
+// ratcheted the stop down bar after bar and turned a 1R loss into an unbounded one.
 if curDir > 0 and rUnit0 > 0
     if beAtR > 0 and high >= curEntry + beAtR * rUnit0
         curStop := math.max(curStop, curEntry)
     if useTrail
-        curStop := math.max(curStop, ta.highest(high, swingLB) - trailMult * atr)
-    curStop := math.min(curStop, close - syminfo.mintick)
+        curStop := math.max(curStop, swingHi - trailMult * atr)
 if curDir < 0 and rUnit0 > 0
     if beAtR > 0 and low <= curEntry - beAtR * rUnit0
         curStop := math.min(curStop, curEntry)
     if useTrail
-        curStop := math.min(curStop, ta.lowest(low, swingLB) + trailMult * atr)
-    curStop := math.max(curStop, close + syminfo.mintick)
+        curStop := math.min(curStop, swingLo + trailMult * atr)
 
-float tg1 = na(rUnit0) ? na : curDir > 0 ? curEntry + rt1 * rUnit0 : curEntry - rt1 * rUnit0
-float tg2 = na(rUnit0) ? na : curDir > 0 ? curEntry + rt2 * rUnit0 : curEntry - rt2 * rUnit0
-float tg3 = na(rUnit0) ? na : curDir > 0 ? curEntry + rt3 * rUnit0 : curEntry - rt3 * rUnit0
+float tg1 = curDir == 0 or na(rUnit0) ? na : curDir > 0 ? curEntry + rt1 * rUnit0 : curEntry - rt1 * rUnit0
+float tg2 = curDir == 0 or na(rUnit0) ? na : curDir > 0 ? curEntry + rt2 * rUnit0 : curEntry - rt2 * rUnit0
+float tg3 = curDir == 0 or na(rUnit0) ? na : curDir > 0 ? curEntry + rt3 * rUnit0 : curEntry - rt3 * rUnit0
 
-// qty_percent is a percent of what is still open: 33 -> 50 -> rest ≈ equal thirds.
-if strategy.position_size > 0 and not na(curStop)
-    if useTargets
-        strategy.exit("L1", "L", qty_percent = 33, stop = curStop, limit = tg1, comment_profit = "T1", comment_loss = "stop")
-        strategy.exit("L2", "L", qty_percent = 50, stop = curStop, limit = tg2, comment_profit = "T2", comment_loss = "stop")
+// --- target latches ---------------------------------------------------------
+// Re-issuing a filled exit id re-creates the order. With a limit already behind the
+// market it fills again at the next open, shedding another slice every bar until the
+// position is gone. These latches stop each leg being submitted once it has traded.
+if curDir > 0 and strategy.position_size > 0
+    if high >= tg1
+        tookT1 := true
+    if high >= tg2
+        tookT2 := true
+if curDir < 0 and strategy.position_size < 0
+    if low <= tg1
+        tookT1 := true
+    if low <= tg2
+        tookT2 := true
+
+// --- protective orders ------------------------------------------------------
+// Absolute thirds, not qty_percent. qty_percent is a share of the position, so
+// 33 / 50 / remainder is 33/50/17 of the original size, not the equal thirds the
+// setting promises.
+float leg = na(posQty) ? na : posQty / 3.0
+
+if curDir > 0 and not na(curStop)
+    if useTargets and not na(leg)
+        if not tookT1
+            strategy.exit("L1", "L", qty = leg, stop = curStop, limit = tg1, comment_profit = "T1", comment_loss = "stop")
+        if not tookT2
+            strategy.exit("L2", "L", qty = leg, stop = curStop, limit = tg2, comment_profit = "T2", comment_loss = "stop")
         strategy.exit("L3", "L", stop = curStop, limit = tg3, comment_profit = "T3", comment_loss = "stop")
     else
         strategy.exit("LX", "L", stop = curStop, comment_loss = "stop")
-if strategy.position_size < 0 and not na(curStop)
-    if useTargets
-        strategy.exit("S1", "S", qty_percent = 33, stop = curStop, limit = tg1, comment_profit = "T1", comment_loss = "stop")
-        strategy.exit("S2", "S", qty_percent = 50, stop = curStop, limit = tg2, comment_profit = "T2", comment_loss = "stop")
+if curDir < 0 and not na(curStop)
+    if useTargets and not na(leg)
+        if not tookT1
+            strategy.exit("S1", "S", qty = leg, stop = curStop, limit = tg1, comment_profit = "T1", comment_loss = "stop")
+        if not tookT2
+            strategy.exit("S2", "S", qty = leg, stop = curStop, limit = tg2, comment_profit = "T2", comment_loss = "stop")
         strategy.exit("S3", "S", stop = curStop, limit = tg3, comment_profit = "T3", comment_loss = "stop")
     else
         strategy.exit("SX", "S", stop = curStop, comment_loss = "stop")
 
-// Discretionary flats: conviction gone, or outside the tested window.
+// --- discretionary flats ----------------------------------------------------
+// A close beyond the stop while still in the position (a gap through it on the very
+// first bar) is exited at market. The stop is never moved to meet price.
+if strategy.position_size > 0 and curDir > 0 and not na(curStop) and close < curStop
+    strategy.close("L", comment = "stop breached")
+if strategy.position_size < 0 and curDir < 0 and not na(curStop) and close > curStop
+    strategy.close("S", comment = "stop breached")
 if flatOnFade and strategy.position_size != 0 and math.abs(score) < exitTh
     strategy.close_all(comment = "score faded")
 if strategy.position_size != 0 and not inWindow
     strategy.close_all(comment = "out of window")
+
+prevPos := strategy.position_size
 
 // -----------------------------------------------------------------------------
 // 14 · VISUALS
@@ -575,6 +690,7 @@ if showStruct and (bosUp or bosDn)
     float lvl     = bosUp ? lastPH : lastPL
     bool  isChoch = bosUp ? chochUp : chochDn
     line.new(fromBar, lvl, bar_index, lvl, color = color.new(bosUp ? cBull : cBear, 25), style = isChoch ? line.style_solid : line.style_dotted, width = isChoch ? 2 : 1)
+    label.new(bar_index, lvl, isChoch ? "CHoCH" : "BOS", style = bosUp ? label.style_label_down : label.style_label_up, color = color.new(bosUp ? cBull : cBear, 20), textcolor = color.white, size = size.tiny)
 
 plotshape(showSig and longSig,  "Long signal",  shape.triangleup,   location.belowbar, color = cBull, size = size.tiny)
 plotshape(showSig and shortSig, "Short signal", shape.triangledown, location.abovebar, color = cBear, size = size.tiny)
@@ -596,6 +712,8 @@ plot(sFlow,    "F6 volume flow", display = display.data_window)
 plot(sHtf,     "F7 HTF bias", display = display.data_window)
 plot(atrPct,   "ATR %", display = display.data_window)
 plot(volPct,   "Volatility percentile", display = display.data_window)
+plot(slopeATR, "Slope (ATR)", display = display.data_window)
+plot(distATR,  "Displacement (ATR)", display = display.data_window)
 
 // -----------------------------------------------------------------------------
 // 15 · TRANSPARENCY PANEL
@@ -639,7 +757,7 @@ if showPanel and barstate.islast
          str.tostring(distATR, "#.##") + " atr",
          str.tostring(rsi, "#.#"),
          str.tostring(adxVal, "#.#") + " adx",
-         structDir > 0 ? "bullish" : structDir < 0 ? "bearish" : "none",
+         structEff > 0 ? "bullish" : structEff < 0 ? "bearish" : structDir != 0 ? "expired" : "none",
          volUsable ? str.tostring(mfi, "#.#") : "n/a",
          htfOn ? str.tostring(sHtf, "#.##") : "off")
     array<float>  fBias = array.from(sTrend, sDist, sMom, sAdx, sStruct, sFlow, sHtf)
@@ -662,18 +780,25 @@ if showPanel and barstate.islast
     f_row(dash, 16, "Volume feed", volUsable ? "usable" : "absent → factor dropped", "", "", "", volUsable ? cTxt : cDim, cPanel)
 
     f_row(dash, 17, "ACTIVE SETUP", "", "", "", "", cTxt, cHdr)
-    f_row(dash, 18, "Stance", stance > 0 ? "LONG" : stance < 0 ? "SHORT" : "flat", "", "since", na(eEntry) ? "—" : str.tostring(bar_index - lastSigBar) + "b", stance > 0 ? cBull : stance < 0 ? cBear : cDim, cPanel)
+    f_row(dash, 18, "Stance", stance > 0 ? "LONG" : stance < 0 ? "SHORT" : "flat", setupState, "since", na(eEntry) ? "—" : str.tostring(bar_index - lastSigBar) + "b", stance > 0 ? cBull : stance < 0 ? cBear : cDim, cPanel)
     f_row(dash, 19, "Entry", na(eEntry) ? "—" : str.tostring(eEntry, format.mintick), "", "", "", cTxt, cPanel)
     f_row(dash, 20, "Stop", na(eStop) ? "—" : str.tostring(eStop, format.mintick), "", "atr", na(riskATR) ? "—" : str.tostring(riskATR, "#.##"), cBear, cPanel)
     f_row(dash, 21, "Targets 1 / 2 / 3", na(eT1) ? "—" : str.tostring(eT1, format.mintick) + " / " + str.tostring(eT2, format.mintick) + " / " + str.tostring(eT3, format.mintick), "", "R", str.tostring(rt1, "#.#") + "/" + str.tostring(rt2, "#.#") + "/" + str.tostring(rt3, "#.#"), cBull, cPanel)
-    f_row(dash, 22, "Size @ " + str.tostring(riskPct, "#.##") + "% risk", na(sizeUnits) ? "—" : str.tostring(sizeUnits, "#.####") + " units", "", "risk", na(riskPerUnit) ? "—" : str.tostring(acctSize * riskPct / 100.0, "#.##"), cTxt, cPanel)
+    f_row(dash, 22, sizeLabel, na(sizeUnits) ? "—" : str.tostring(sizeUnits, "#.####") + " units", "", "risk", sizeRisk, cTxt, cPanel)
     f_row(dash, 23, closedOnly ? "Closed-bar signals" : "Intrabar signals (mutable)", htfStrict ? "HTF: closed bar" : "HTF: live bar", "", "", "", cDim, cPanel)
+
     f_row(dash, 24, "Position", strategy.position_size > 0 ? "LONG " + str.tostring(strategy.position_size, "#.####") : strategy.position_size < 0 ? "SHORT " + str.tostring(math.abs(strategy.position_size), "#.####") : "flat", "", "avg", strategy.position_size != 0 ? str.tostring(strategy.position_avg_price, format.mintick) : "—", strategy.position_size > 0 ? cBull : strategy.position_size < 0 ? cBear : cDim, cPanel)
     f_row(dash, 25, "Open P&L", str.tostring(strategy.openprofit, "#.##"), "", "equity", str.tostring(strategy.equity, "#.##"), strategy.openprofit > 0 ? cBull : strategy.openprofit < 0 ? cBear : cDim, cPanel)
 
 // -----------------------------------------------------------------------------
 // 16 · ALERTS
 // -----------------------------------------------------------------------------
-alertcondition(longSig,  "FURE-S · Long signal",  "FURE-S LONG {{ticker}} {{interval}}")
-alertcondition(shortSig, "FURE-S · Short signal", "FURE-S SHORT {{ticker}} {{interval}}")
-alertcondition(regime != regime[1], "FURE-S · Regime change", "FURE-S regime change {{ticker}} {{interval}}")
+// alertcondition() is an indicator-only function — a strategy uses alert() plus
+// TradingView's own order-fill alerts. The previous version's alertcondition calls
+// left the strategy with no working alert path at all.
+if longSig or shortSig
+    alert((longSig ? "FURE-S LONG " : "FURE-S SHORT ") + syminfo.ticker + " " + timeframe.period +
+         " | score " + str.tostring(score, "#.#") +
+         " | regime " + regime +
+         " | ref entry " + str.tostring(close, format.mintick) +
+         " | ref stop " + str.tostring(longSig ? stopL : stopS, format.mintick), alert.freq_once_per_bar_close)
