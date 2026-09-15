@@ -58,17 +58,26 @@ The two scripts draw the same layers. With both loaded and both drawing you get 
 adaptive MAs, two sets of structure lines, two sets of arrows and two panels on top
 of each other — it looks like a rendering bug and is really just double-drawing.
 
-So they ship pre-divided:
+So they ship pre-divided — **the indicator is the display, the strategy is the
+execution**:
 
 | | Indicator | Strategy |
 | --- | --- | --- |
-| MA, structure, arrows, compression shading | **on** | **off** |
+| MA, ribbon, bar colour, structure, arrows, shading | **on** | **off** |
+| Dashboard panel | **on**, top right | **off** |
 | Live stop / target of the open trade | — | **on** (the indicator has no open trade) |
-| Panel | Top right | **Bottom right** |
 
-The indicator owns the chart; the strategy adds its fills, its live risk levels and
-two extra panel rows. Running the strategy on its own? Turn its layers back on in
-**⑦ Visuals** — each one says so in its tooltip.
+Only one panel renders. Everything the strategy alone knows — position, P&L,
+drawdown — is already in TradingView's Strategy Tester below the chart, so a second
+panel repeating it costs screen height and adds nothing.
+
+Running the strategy *without* the indicator? Turn its layers back on in **⑦
+Visuals**; each toggle says so in its tooltip, and its panel defaults to the
+opposite corner so even both-on does not overlap.
+
+**Tight on screen height?** Set the indicator's **Panel detail** to `Compact ·
+essentials only` — 12 rows instead of 25, keeping score, regime, playbook, entry
+trigger and the full active setup, dropping the factor breakdown and context block.
 
 ---
 
@@ -82,6 +91,19 @@ two extra panel rows. Running the strategy on its own? Turn its layers back on i
    backtestable version (paste into a *New blank strategy*).
 
 No libraries, no imports, no external dependencies.
+
+---
+
+## What the chart draws
+
+| Element | What it tells you |
+| --- | --- |
+| **Adaptive MA + ribbon** | Trend reference, with bands at ±0.6 and ±1.2 ATR. The ribbon's *width* is a live read on volatility — it breathes as ATR expands and contracts |
+| **Bar colour** | Solid = score past the entry threshold, faded = leaning, grey = no edge |
+| **Risk / reward zones** | Stop zone and target zone as shaded boxes, T1/T2 dotted inside. The ratio between the two boxes *is* the R multiple, readable without arithmetic |
+| **Bold line + ENTRY tag** | The armed trigger price, and the bar price confirmed it |
+| **Grey background** | Compression — volatility contracting |
+| **Step line + BOS/CHoCH tags** | The active structure level and the breaks that set it |
 
 ---
 
