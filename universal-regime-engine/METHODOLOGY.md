@@ -271,6 +271,44 @@ point value yourself.
 
 ---
 
+## 5b. Signal vs entry — the arming model
+
+A signal is a statement about the *evidence*. An entry is a statement about *price*.
+Collapsing the two is the most common way a confluence tool produces trades it should
+not have taken, because it acts on agreement that price then immediately contradicts.
+
+In **Confirm** mode (default) a signal arms a setup rather than entering it:
+
+```
+on signal:    armLevel = high + 1 tick   (long)    armStop = stopL
+                       = low  − 1 tick   (short)   armStop = stopS
+              armBar   = bar_index
+fire (long):  armAge > 0  and  high ≥ armLevel
+void:         armAge > 0  and  |score| < exitTh          → setup dropped
+lapse:        armAge > armExpiry                          → setup dropped
+```
+
+`armAge > 0` is what forces the entry onto a *later* bar than the signal — the same
+bar cannot both propose and confirm. A trigger on the last valid bar wins over the
+lapse, because the void/lapse tests require `not fire`.
+
+The entry price, stop, targets, R and position size are all computed from `armLevel`,
+not from the signal bar's close. That matters: if you enter on a break of the signal
+bar's high, your risk is measured from that break, and pricing the trade at the close
+would understate it.
+
+**What this buys you.** A signal price never confirms costs nothing — it lapses
+instead of becoming a trade. **What it costs you.** In a market that gaps or runs
+away, confirmation means a worse entry than the close, and some good signals are
+missed entirely. That is the trade being made, stated rather than hidden. Immediate
+mode restores the old behaviour for comparison.
+
+The strategy expresses the same model as a resting **stop order** at `armLevel`,
+cancelled on void or lapse — which is both the faithful translation and the more
+realistic fill assumption than a market order.
+
+---
+
 ## 6b. Setup invalidation
 
 A setup ends for one of three reasons, and the panel names which:

@@ -148,6 +148,8 @@ needStruct= input.bool(true, "Require market-structure agreement", group = grpSi
 needHtf   = input.bool(true, "Require higher-timeframe agreement", group = grpSig)
 cooldown  = input.int(5, "Cooldown between signals (bars)", minval = 0, group = grpSig)
 closedOnly= input.bool(true, "Only evaluate on closed bars", group = grpSig)
+entryMode = input.string("Confirm — break of the signal bar's extreme", "Entry trigger", options = ["Confirm — break of the signal bar's extreme", "Immediate — act on the signal bar"], group = grpSig, tooltip = "A signal means the evidence has lined up. It does not mean 'buy here'. Confirm mode only ARMS the setup at the signal bar's high (long) or low (short); the entry moment is the bar where price actually takes that level out. Signals price never confirms simply lapse.")
+armExpiry = input.int(5, "Armed setup expires after (bars)", minval = 1, group = grpSig, tooltip = "If price has not taken out the armed level within this many bars, the setup lapses untriggered.")
 
 grpRisk = "⑥ Risk model"
 stopMode = input.string("Structure + ATR buffer", "Stop placement", options = ["Structure + ATR buffer", "Pure ATR", "Chandelier"], group = grpRisk)
@@ -157,19 +159,6 @@ rt1      = input.float(1.0, "Target 1 (R)", minval = 0.25, step = 0.25, group = 
 rt2      = input.float(2.0, "Target 2 (R)", minval = 0.25, step = 0.25, group = grpRisk)
 rt3      = input.float(3.0, "Target 3 (R)", minval = 0.25, step = 0.25, group = grpRisk)
 riskPct  = input.float(1.0, "Risk per trade %", minval = 0.01, step = 0.05, group = grpRisk)
-
-grpVis = "⑦ Visuals"
-showMA     = input.bool(true, "Adaptive MA + envelope", group = grpVis)
-showStruct = input.bool(true, "Structure breaks (BOS / CHoCH)", group = grpVis)
-showSig    = input.bool(true, "Signal arrows", group = grpVis)
-showRisk   = input.bool(true, "Stop / target levels", group = grpVis)
-showBg     = input.bool(true, "Shade compression regime", group = grpVis)
-showPanel  = input.bool(true, "Transparency panel", group = grpVis)
-tblPos     = input.string("Top right", "Panel position", options = ["Top right", "Top left", "Bottom right", "Bottom left", "Middle right"], group = grpVis)
-darkUI     = input.bool(true, "Dark panel", group = grpVis)
-cBull      = input.color(#089981, "Bull", inline = "col", group = grpVis)
-cBear      = input.color(#f23645, "Bear", inline = "col", group = grpVis)
-cNeut      = input.color(#787b86, "Neutral", inline = "col", group = grpVis)
 
 // -----------------------------------------------------------------------------
 // 1 · HELPERS
@@ -430,18 +419,22 @@ bool shortSig = candS and not candL and cooled
 if longSig or shortSig
     lastSigBar := bar_index
 
-// Engine stance: what the tool thinks you should be doing right now
-var int stance = 0
-if longSig
-    stance := 1
-if shortSig
-    stance := -1
-bool standDown = stance != 0 and math.abs(score) < exitTh
-if standDown
-    stance := 0
-
 // -----------------------------------------------------------------------------
-// 12 · RISK MODEL — stop first, then targets as multiples of the actual risk
+// 12 · ENTRY TRIGGER + RISK MODEL
+//      A signal says the evidence has lined up. It does not say "buy here".
+//
+//      In CONFIRM mode (default) a signal only ARMS a setup, at the signal bar's
+//      high for a long or its low for a short. The entry moment is the later bar
+//      on which price actually takes that level out — that bar, and that price,
+//      are what the engine reports as the entry. A signal price never confirms
+//      simply lapses after `armExpiry` bars, or is voided early if the score
+//      collapses back into the stand-aside band while waiting.
+//
+//      In IMMEDIATE mode the signal bar is the entry moment, as before.
+//
+//      Everything downstream — stance, stop, targets, R, size — is built from the
+//      TRIGGER price, not the signal bar's close, so the numbers describe the
+//      trade you would actually have.
 // -----------------------------------------------------------------------------
 float swingLo = ta.lowest(low, swingLB)
 float swingHi = ta.highest(high, swingLB)
@@ -457,6 +450,59 @@ float stopS = stopMode == "Pure ATR"   ? close + atrStop * atr :
 stopL := stopL >= close ? close - atrStop * atr : stopL
 stopS := stopS <= close ? close + atrStop * atr : stopS
 
+// --- arming ---------------------------------------------------------------
+bool confirmMode = entryMode == "Confirm — break of the signal bar's extreme"
+
+var int    armDir   = 0
+var float  armLevel = na
+var float  armStop  = na
+var int    armBar   = na
+var string armState = "idle"
+
+if longSig
+    armDir   := 1
+    armLevel := confirmMode ? high + syminfo.mintick : close
+    armStop  := stopL
+    armBar   := bar_index
+if shortSig
+    armDir   := -1
+    armLevel := confirmMode ? low - syminfo.mintick : close
+    armStop  := stopS
+    armBar   := bar_index
+
+int armAge = na(armBar) ? na : bar_index - armBar
+
+// Confirm mode fires on a LATER bar that trades through the armed level.
+// Immediate mode fires on the signal bar itself (you act at the next open).
+bool fireL = armDir > 0 and (confirmMode ? (armAge > 0 and high >= armLevel) : armAge == 0)
+bool fireS = armDir < 0 and (confirmMode ? (armAge > 0 and low  <= armLevel) : armAge == 0)
+
+bool armWaiting = armDir != 0 and confirmMode and not fireL and not fireS and armAge > 0
+bool armVoided  = armWaiting and math.abs(score) < exitTh
+bool armExpired = armWaiting and not armVoided and armAge > armExpiry
+
+if longSig or shortSig
+    armState := confirmMode ? "armed" : "entry"
+else if fireL or fireS
+    armState := "entry"
+else if armVoided
+    armState := "voided · score faded"
+else if armExpired
+    armState := "lapsed · never confirmed"
+
+if fireL or fireS or armVoided or armExpired
+    armDir := 0
+
+// Engine stance: what the tool thinks you should be doing right now
+var int stance = 0
+if fireL
+    stance := 1
+if fireS
+    stance := -1
+bool standDown = stance != 0 and math.abs(score) < exitTh
+if standDown
+    stance := 0
+
 var float eEntry = na
 var float eStop  = na
 var float eT1    = na
@@ -464,17 +510,17 @@ var float eT2    = na
 var float eT3    = na
 var int   eDir   = 0
 
-if longSig
-    eEntry := close
-    eStop  := stopL
+if fireL
+    eEntry := confirmMode ? armLevel : close
+    eStop  := na(armStop) or armStop >= eEntry ? eEntry - atrStop * atr : armStop
     eDir   := 1
     float rUnit = eEntry - eStop
     eT1 := eEntry + rt1 * rUnit
     eT2 := eEntry + rt2 * rUnit
     eT3 := eEntry + rt3 * rUnit
-if shortSig
-    eEntry := close
-    eStop  := stopS
+if fireS
+    eEntry := confirmMode ? armLevel : close
+    eStop  := na(armStop) or armStop <= eEntry ? eEntry + atrStop * atr : armStop
     eDir   := -1
     float rUnitS = eStop - eEntry
     eT1 := eEntry - rt1 * rUnitS
@@ -490,7 +536,7 @@ if shortSig
 // `not (longSig or shortSig)` keeps a setup from being invalidated by the very bar
 // that created it: with a pure-ATR stop, any bar wider than atrStop x ATR would
 // otherwise trip its own stop test the instant it fired.
-bool freshSig     = longSig or shortSig
+bool freshSig     = fireL or fireS
 bool stopBreached = stance != 0 and not freshSig and not na(eStop) and (stance > 0 ? low  <= eStop : high >= eStop)
 bool targetDone   = stance != 0 and not freshSig and not na(eT3)  and (stance > 0 ? high >= eT3   : low  <= eT3)
 
@@ -520,6 +566,23 @@ float riskATR     = na(riskPerUnit) or atr <= 0 ? na : riskPerUnit / atr
 acctSize = input.float(10000, "Account size (position-size hint)", minval = 0, group = grpRisk)
 projBars = input.int(30, "Project levels forward (bars)", minval = 5, group = grpRisk)
 
+// Visual inputs live HERE, not in the shared engine, because the indicator and the
+// strategy need different defaults: running both on one chart otherwise draws two
+// adaptive MAs, two sets of structure lines and two panels on top of each other.
+// The indicator owns the chart, so everything is on by default.
+grpVis = "⑦ Visuals"
+showMA     = input.bool(true, "Adaptive MA + envelope", group = grpVis)
+showStruct = input.bool(true, "Structure breaks (BOS / CHoCH)", group = grpVis)
+showSig    = input.bool(true, "Signal + entry markers", group = grpVis)
+showRisk   = input.bool(true, "Stop / target levels", group = grpVis)
+showBg     = input.bool(true, "Shade compression regime", group = grpVis)
+showPanel  = input.bool(true, "Transparency panel", group = grpVis)
+tblPos     = input.string("Top right", "Panel position", options = ["Top right", "Top left", "Bottom right", "Bottom left", "Middle right"], group = grpVis)
+darkUI     = input.bool(true, "Dark panel", group = grpVis)
+cBull      = input.color(#089981, "Bull", inline = "col", group = grpVis)
+cBear      = input.color(#f23645, "Bear", inline = "col", group = grpVis)
+cNeut      = input.color(#787b86, "Neutral", inline = "col", group = grpVis)
+
 float  sizeUnits = na(riskPerUnit) or riskPerUnit <= 0 ? na : acctSize * riskPct / 100.0 / riskPerUnit
 string sizeLabel = "Size @ " + str.tostring(riskPct, "#.##") + "% of " + str.tostring(acctSize, "#")
 string sizeRisk  = na(riskPerUnit) ? "—" : str.tostring(acctSize * riskPct / 100.0, "#.##")
@@ -545,8 +608,16 @@ if showStruct and (bosUp or bosDn)
     line.new(fromBar, lvl, bar_index, lvl, color = color.new(bosUp ? cBull : cBear, 25), style = isChoch ? line.style_solid : line.style_dotted, width = isChoch ? 2 : 1)
     label.new(bar_index, lvl, isChoch ? "CHoCH" : "BOS", style = bosUp ? label.style_label_down : label.style_label_up, color = color.new(bosUp ? cBull : cBear, 20), textcolor = color.white, size = size.tiny)
 
-plotshape(showSig and longSig,  "Long signal",  shape.triangleup,   location.belowbar, color = cBull, size = size.small, text = "LONG")
-plotshape(showSig and shortSig, "Short signal", shape.triangledown, location.abovebar, color = cBear, size = size.small, text = "SHORT")
+// A signal ARMS; the ENTRY marker is the bar price actually confirmed it. The
+// dotted line between them is the exact price that has to trade for the entry.
+plot(showSig and armDir != 0 ? armLevel : na, "Armed trigger level", color = color.new(armDir > 0 ? cBull : cBear, 10), style = plot.style_linebr, linewidth = 2)
+
+plotshape(showSig and longSig,  "Signal · long armed",  shape.triangleup,   location.belowbar, color = color.new(cBull, 45), size = size.tiny)
+plotshape(showSig and shortSig, "Signal · short armed", shape.triangledown, location.abovebar, color = color.new(cBear, 45), size = size.tiny)
+
+plotshape(showSig and fireL, "ENTRY long",  shape.labelup,   location.belowbar, color = cBull, textcolor = color.white, text = "ENTRY", size = size.small)
+plotshape(showSig and fireS, "ENTRY short", shape.labeldown, location.abovebar, color = cBear, textcolor = color.white, text = "ENTRY", size = size.small)
+plotshape(showSig and (armVoided or armExpired), "Armed setup lapsed", shape.xcross, location.belowbar, color = color.new(cNeut, 25), size = size.tiny)
 plotshape(showSig and standDown, "Stand aside", shape.xcross, location.top, color = cNeut, size = size.tiny)
 plotshape(showSig and stopBreached, "Setup invalidated", shape.xcross, location.bottom, color = cBear, size = size.tiny)
 
@@ -557,7 +628,7 @@ var line lnT2   = na
 var line lnT3   = na
 var label lbSet = na
 
-if showRisk and (longSig or shortSig)
+if showRisk and (fireL or fireS)
     line.delete(lnStop)
     line.delete(lnEnt)
     line.delete(lnT1)
@@ -608,7 +679,7 @@ color cHdr   = darkUI ? color.new(#2a2e39, 8)  : color.new(#e0e3eb, 8)
 color cTxt   = darkUI ? #d1d4dc : #131722
 color cDim   = darkUI ? #787b86 : #5d606b
 
-var table dash = table.new(tablePos, 5, 24, border_width = 1, frame_width = 1, frame_color = cHdr)
+var table dash = table.new(tablePos, 5, 26, border_width = 1, frame_width = 1, frame_color = cHdr)
 
 f_row(t, r, c0, c1, c2, c3, c4, col, bg) =>
     table.cell(t, 0, r, c0, text_color = cDim, bgcolor = bg, text_size = size.small, text_halign = text.align_left)
@@ -658,23 +729,40 @@ if showPanel and barstate.islast
 
     f_row(dash, 17, "ACTIVE SETUP", "", "", "", "", cTxt, cHdr)
     f_row(dash, 18, "Stance", stance > 0 ? "LONG" : stance < 0 ? "SHORT" : "flat", setupState, "since", na(eEntry) ? "—" : str.tostring(bar_index - lastSigBar) + "b", stance > 0 ? cBull : stance < 0 ? cBear : cDim, cPanel)
-    f_row(dash, 19, "Entry", na(eEntry) ? "—" : str.tostring(eEntry, format.mintick), "", "", "", cTxt, cPanel)
-    f_row(dash, 20, "Stop", na(eStop) ? "—" : str.tostring(eStop, format.mintick), "", "atr", na(riskATR) ? "—" : str.tostring(riskATR, "#.##"), cBear, cPanel)
-    f_row(dash, 21, "Targets 1 / 2 / 3", na(eT1) ? "—" : str.tostring(eT1, format.mintick) + " / " + str.tostring(eT2, format.mintick) + " / " + str.tostring(eT3, format.mintick), "", "R", str.tostring(rt1, "#.#") + "/" + str.tostring(rt2, "#.#") + "/" + str.tostring(rt3, "#.#"), cBull, cPanel)
-    f_row(dash, 22, sizeLabel, na(sizeUnits) ? "—" : str.tostring(sizeUnits, "#.####") + " units", "", "risk", sizeRisk, cTxt, cPanel)
-    f_row(dash, 23, closedOnly ? "Closed-bar signals" : "Intrabar signals (mutable)", htfStrict ? "HTF: closed bar" : "HTF: live bar", "", "", "", cDim, cPanel)
+    f_row(dash, 19, "Entry trigger",
+         armDir != 0 ? str.tostring(armLevel, format.mintick) : armState == "entry" ? "fired" : "—",
+         armDir != 0 ? (armDir > 0 ? "break above" : "break below") : "",
+         armDir != 0 and confirmMode ? "expires" : "",
+         armDir != 0 and confirmMode ? str.tostring(math.max(0, armExpiry - armAge)) + "b" : "",
+         armDir > 0 ? cBull : armDir < 0 ? cBear : armState == "entry" ? cTxt : cDim, cPanel)
+    f_row(dash, 20, "Entry", na(eEntry) ? "—" : str.tostring(eEntry, format.mintick), armState, "", "", cTxt, cPanel)
+    f_row(dash, 21, "Stop", na(eStop) ? "—" : str.tostring(eStop, format.mintick), "", "atr", na(riskATR) ? "—" : str.tostring(riskATR, "#.##"), cBear, cPanel)
+    f_row(dash, 22, "Targets 1 / 2 / 3", na(eT1) ? "—" : str.tostring(eT1, format.mintick) + " / " + str.tostring(eT2, format.mintick) + " / " + str.tostring(eT3, format.mintick), "", "R", str.tostring(rt1, "#.#") + "/" + str.tostring(rt2, "#.#") + "/" + str.tostring(rt3, "#.#"), cBull, cPanel)
+    f_row(dash, 23, sizeLabel, na(sizeUnits) ? "—" : str.tostring(sizeUnits, "#.####") + " units", "", "risk", sizeRisk, cTxt, cPanel)
+    f_row(dash, 24, closedOnly ? "Closed-bar signals" : "Intrabar signals (mutable)", htfStrict ? "HTF: closed bar" : "HTF: live bar", "", "", "", cDim, cPanel)
 
 // -----------------------------------------------------------------------------
 // 15 · ALERTS
 // -----------------------------------------------------------------------------
-alertcondition(longSig,  "FURE · Long signal",  "FURE LONG {{ticker}} {{interval}}")
-alertcondition(shortSig, "FURE · Short signal", "FURE SHORT {{ticker}} {{interval}}")
+// Two tiers, because they are two different moments: the ARMED alert gives you
+// time to get ready, the ENTRY alert is the one you act on.
+alertcondition(longSig,  "FURE · Long armed",   "FURE long ARMED {{ticker}} {{interval}} — waiting for price to confirm")
+alertcondition(shortSig, "FURE · Short armed",  "FURE short ARMED {{ticker}} {{interval}} — waiting for price to confirm")
+alertcondition(fireL,    "FURE · ENTRY long",   "FURE ENTRY LONG {{ticker}} {{interval}}")
+alertcondition(fireS,    "FURE · ENTRY short",  "FURE ENTRY SHORT {{ticker}} {{interval}}")
 alertcondition(standDown, "FURE · Stand aside", "FURE STAND ASIDE {{ticker}} {{interval}}")
 alertcondition(regime != regime[1], "FURE · Regime change", "FURE regime change {{ticker}} {{interval}}")
 alertcondition(chochUp or chochDn, "FURE · Change of character", "FURE CHoCH {{ticker}} {{interval}}")
 
-if longSig or shortSig
-    alert((longSig ? "FURE LONG " : "FURE SHORT ") + syminfo.ticker + " " + timeframe.period +
+if (longSig or shortSig) and confirmMode
+    alert((longSig ? "FURE LONG ARMED " : "FURE SHORT ARMED ") + syminfo.ticker + " " + timeframe.period +
+         " | score " + str.tostring(score, "#.#") +
+         " | regime " + regime +
+         " | triggers on a break of " + str.tostring(armLevel, format.mintick) +
+         " | valid for " + str.tostring(armExpiry) + " bars", alert.freq_once_per_bar_close)
+
+if fireL or fireS
+    alert((fireL ? "FURE ENTRY LONG " : "FURE ENTRY SHORT ") + syminfo.ticker + " " + timeframe.period +
          " | score " + str.tostring(score, "#.#") +
          " | regime " + regime +
          " | entry " + str.tostring(eEntry, format.mintick) +

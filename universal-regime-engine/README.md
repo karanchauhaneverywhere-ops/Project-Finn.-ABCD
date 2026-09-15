@@ -52,6 +52,26 @@ to avoid.
 
 ---
 
+## Running both on one chart
+
+The two scripts draw the same layers. With both loaded and both drawing you get two
+adaptive MAs, two sets of structure lines, two sets of arrows and two panels on top
+of each other — it looks like a rendering bug and is really just double-drawing.
+
+So they ship pre-divided:
+
+| | Indicator | Strategy |
+| --- | --- | --- |
+| MA, structure, arrows, compression shading | **on** | **off** |
+| Live stop / target of the open trade | — | **on** (the indicator has no open trade) |
+| Panel | Top right | **Bottom right** |
+
+The indicator owns the chart; the strategy adds its fills, its live risk levels and
+two extra panel rows. Running the strategy on its own? Turn its layers back on in
+**⑦ Visuals** — each one says so in its tooltip.
+
+---
+
 ## Installing
 
 1. TradingView → **Pine Editor** → *Open* → *New blank indicator*.
@@ -99,6 +119,41 @@ stance with its stop, targets and a position-size hint.
 Every intermediate value is also plotted to the **Data Window** (score, each of
 the seven factor biases, ATR%, volatility percentile, raw slope and
 displacement in ATR), so you can inspect any historical bar, not just the last.
+
+---
+
+## The entry moment
+
+A signal means *the evidence has lined up*. It does not mean *buy here*. Those are
+different moments, and the engine now separates them.
+
+**Confirm mode (default).** A signal only **arms** a setup, at the signal bar's high
+for a long or its low for a short. The entry moment is the later bar where price
+actually trades through that level. You see:
+
+| On the chart | Meaning |
+| --- | --- |
+| Small faded triangle | Signal — setup **armed** |
+| Bold line extending right | The exact price that confirms it |
+| **ENTRY** label | Price took the level out — this is the moment |
+| Small ✕ | The setup lapsed: price never confirmed, or the score faded first |
+
+The panel's **Entry trigger** row shows the armed price, which direction confirms it,
+and how many bars remain before it lapses.
+
+Everything downstream — stop, targets, R, size — is built from the **trigger price**,
+not the signal bar's close, so the numbers describe the trade you would actually get.
+
+Two alert tiers follow the same split: *armed* gives you time to get ready, *ENTRY*
+is the one you act on.
+
+**Immediate mode** restores the old behaviour: the signal bar is the entry moment.
+
+Why this matters: a signal price refuses to confirm is exactly the signal you did not
+want. In confirm mode those cost you nothing — they lapse untriggered instead of
+becoming trades. The strategy implements this as a resting **stop order** at the
+armed level, cancelled if the setup lapses, which is also the more realistic fill
+assumption.
 
 ---
 
