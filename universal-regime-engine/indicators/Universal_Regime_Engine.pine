@@ -559,29 +559,32 @@ float riskATR     = na(riskPerUnit) or atr <= 0 ? na : riskPerUnit / atr
 
 // -----------------------------------------------------------------------------
 // 12c · PRESENTATION LAYER  (indicator only — NOT part of the shared engine)
-//       The strategy defines its own sizeUnits/sizeLabel/sizeRisk from real
-//       strategy equity, so the panel never shows a number the script does not
-//       actually use.
+//       The strategy defines its own copies of these from real strategy equity, so
+//       neither script's panel can ever show a number it does not actually use.
 // -----------------------------------------------------------------------------
 acctSize = input.float(10000, "Account size (position-size hint)", minval = 0, group = grpRisk)
 projBars = input.int(30, "Project levels forward (bars)", minval = 5, group = grpRisk)
 
 // Visual inputs live HERE, not in the shared engine, because the indicator and the
-// strategy need different defaults: running both on one chart otherwise draws two
-// adaptive MAs, two sets of structure lines and two panels on top of each other.
-// The indicator owns the chart, so everything is on by default.
+// strategy need different defaults: running both on one chart with the same
+// defaults draws two of everything. The indicator owns the chart.
 grpVis = "⑦ Visuals"
-showMA     = input.bool(true, "Adaptive MA + envelope", group = grpVis)
-showStruct = input.bool(true, "Structure breaks (BOS / CHoCH)", group = grpVis)
-showSig    = input.bool(true, "Signal + entry markers", group = grpVis)
-showRisk   = input.bool(true, "Stop / target levels", group = grpVis)
-showBg     = input.bool(true, "Shade compression regime", group = grpVis)
-showPanel  = input.bool(true, "Transparency panel", group = grpVis)
+panelMode  = input.string("Full · every factor", "Panel detail", options = ["Full · every factor", "Compact · essentials only"], group = grpVis, tooltip = "Compact drops the factor breakdown and the context block — about a third of the height, for a laptop screen. The breakdown is the point of the tool, so Full is the default.")
+showPanel  = input.bool(true, "Dashboard panel", group = grpVis)
 tblPos     = input.string("Top right", "Panel position", options = ["Top right", "Top left", "Bottom right", "Bottom left", "Middle right"], group = grpVis)
 darkUI     = input.bool(true, "Dark panel", group = grpVis)
+showMA     = input.bool(true, "Adaptive MA", group = grpVis)
+showRibbon = input.bool(true, "Volatility ribbon", group = grpVis, tooltip = "Bands at ±0.6 and ±1.2 ATR around the adaptive MA. The ribbon's width is a live read on volatility, not decoration — it widens as ATR expands.")
+colorBars  = input.bool(true, "Colour bars by score", group = grpVis, tooltip = "Solid = score beyond the entry threshold, faded = leaning, grey = no edge.")
+showStruct = input.bool(true, "Structure breaks (BOS / CHoCH)", group = grpVis)
+showSig    = input.bool(true, "Signal + entry markers", group = grpVis)
+showZones  = input.bool(true, "Risk / reward zones", group = grpVis, tooltip = "The stop zone and the target zone drawn as shaded boxes, with the T1/T2 ladder inside.")
+showBg     = input.bool(true, "Shade compression regime", group = grpVis)
 cBull      = input.color(#089981, "Bull", inline = "col", group = grpVis)
 cBear      = input.color(#f23645, "Bear", inline = "col", group = grpVis)
 cNeut      = input.color(#787b86, "Neutral", inline = "col", group = grpVis)
+
+string panelTitle = "UNIVERSAL REGIME ENGINE"
 
 float  sizeUnits = na(riskPerUnit) or riskPerUnit <= 0 ? na : acctSize * riskPct / 100.0 / riskPerUnit
 string sizeLabel = "Size @ " + str.tostring(riskPct, "#.##") + "% of " + str.tostring(acctSize, "#")
@@ -591,11 +594,27 @@ string sizeRisk  = na(riskPerUnit) ? "—" : str.tostring(acctSize * riskPct / 1
 // 13 · VISUALS
 // -----------------------------------------------------------------------------
 color trendCol = score > 15 ? cBull : score < -15 ? cBear : cNeut
-float kamaSig  = ta.ema(kama, math.max(2, erLen / 2))
+float ribStep  = atr * 0.6
 
+// Adaptive MA + volatility ribbon. The bands are ATR-spaced, so the ribbon's width
+// is itself information: it breathes with volatility instead of being cosmetic.
 pMa  = plot(showMA ? kama : na, "Adaptive MA", color = trendCol, linewidth = 2)
-pSig = plot(showMA ? kamaSig : na, "MA envelope", color = color.new(trendCol, 55), linewidth = 1)
-fill(pMa, pSig, color = color.new(trendCol, 88), title = "Trend envelope")
+pU1  = plot(showRibbon ? kama + ribStep : na,       "Ribbon +0.6 ATR", color = color.new(trendCol, 78))
+pD1  = plot(showRibbon ? kama - ribStep : na,       "Ribbon −0.6 ATR", color = color.new(trendCol, 78))
+pU2  = plot(showRibbon ? kama + ribStep * 2 : na,   "Ribbon +1.2 ATR", color = color.new(trendCol, 88))
+pD2  = plot(showRibbon ? kama - ribStep * 2 : na,   "Ribbon −1.2 ATR", color = color.new(trendCol, 88))
+fill(pU1, pMa, color = color.new(trendCol, 84), title = "Ribbon inner (upper)")
+fill(pMa, pD1, color = color.new(trendCol, 84), title = "Ribbon inner (lower)")
+fill(pU2, pU1, color = color.new(trendCol, 92), title = "Ribbon outer (upper)")
+fill(pD1, pD2, color = color.new(trendCol, 92), title = "Ribbon outer (lower)")
+
+// Bar colour is a read on the score band, not decoration: solid past the entry
+// threshold, faded when merely leaning, grey when there is no edge.
+color barCol = score >  entryTh ? cBull :
+     score < -entryTh            ? cBear :
+     score >  15                 ? color.new(cBull, 55) :
+     score < -15                 ? color.new(cBear, 55) : color.new(cNeut, 60)
+barcolor(colorBars ? barCol : na, title = "Score-coloured bars")
 
 bgcolor(showBg and sqzOn ? color.new(cNeut, 90) : na, title = "Compression")
 
@@ -608,43 +627,44 @@ if showStruct and (bosUp or bosDn)
     line.new(fromBar, lvl, bar_index, lvl, color = color.new(bosUp ? cBull : cBear, 25), style = isChoch ? line.style_solid : line.style_dotted, width = isChoch ? 2 : 1)
     label.new(bar_index, lvl, isChoch ? "CHoCH" : "BOS", style = bosUp ? label.style_label_down : label.style_label_up, color = color.new(bosUp ? cBull : cBear, 20), textcolor = color.white, size = size.tiny)
 
-// A signal ARMS; the ENTRY marker is the bar price actually confirmed it. The
-// dotted line between them is the exact price that has to trade for the entry.
+// A signal ARMS; the ENTRY marker is the bar price actually confirmed it. The bold
+// line between them is the exact price that has to trade.
 plot(showSig and armDir != 0 ? armLevel : na, "Armed trigger level", color = color.new(armDir > 0 ? cBull : cBear, 10), style = plot.style_linebr, linewidth = 2)
 
 plotshape(showSig and longSig,  "Signal · long armed",  shape.triangleup,   location.belowbar, color = color.new(cBull, 45), size = size.tiny)
 plotshape(showSig and shortSig, "Signal · short armed", shape.triangledown, location.abovebar, color = color.new(cBear, 45), size = size.tiny)
-
 plotshape(showSig and fireL, "ENTRY long",  shape.labelup,   location.belowbar, color = cBull, textcolor = color.white, text = "ENTRY", size = size.small)
 plotshape(showSig and fireS, "ENTRY short", shape.labeldown, location.abovebar, color = cBear, textcolor = color.white, text = "ENTRY", size = size.small)
 plotshape(showSig and (armVoided or armExpired), "Armed setup lapsed", shape.xcross, location.belowbar, color = color.new(cNeut, 25), size = size.tiny)
 plotshape(showSig and standDown, "Stand aside", shape.xcross, location.top, color = cNeut, size = size.tiny)
 plotshape(showSig and stopBreached, "Setup invalidated", shape.xcross, location.bottom, color = cBear, size = size.tiny)
 
-var line lnStop = na
-var line lnEnt  = na
-var line lnT1   = na
-var line lnT2   = na
-var line lnT3   = na
-var label lbSet = na
+// Risk and reward as shaded ZONES rather than a stack of thin lines — the ratio
+// between the two boxes is the R multiple, readable at a glance.
+var box   bxRisk = na
+var box   bxRwrd = na
+var line  lnEnt  = na
+var line  lnT1   = na
+var line  lnT2   = na
+var label lbSet  = na
 
-if showRisk and (fireL or fireS)
-    line.delete(lnStop)
+if showZones and (fireL or fireS)
+    box.delete(bxRisk)
+    box.delete(bxRwrd)
     line.delete(lnEnt)
     line.delete(lnT1)
     line.delete(lnT2)
-    line.delete(lnT3)
     label.delete(lbSet)
     int x2 = bar_index + projBars
-    lnEnt  := line.new(bar_index, eEntry, x2, eEntry, color = cNeut,  style = line.style_solid,  width = 1)
-    lnStop := line.new(bar_index, eStop,  x2, eStop,  color = cBear,  style = line.style_dashed, width = 1)
-    lnT1   := line.new(bar_index, eT1,    x2, eT1,    color = cBull,  style = line.style_dotted, width = 1)
-    lnT2   := line.new(bar_index, eT2,    x2, eT2,    color = cBull,  style = line.style_dotted, width = 1)
-    lnT3   := line.new(bar_index, eT3,    x2, eT3,    color = cBull,  style = line.style_dotted, width = 1)
-    lbSet  := label.new(x2, eStop,
-         (eDir > 0 ? "LONG  " : "SHORT ") + str.tostring(eEntry, format.mintick) +
-         "\nstop " + str.tostring(eStop, format.mintick) + "  (" + str.tostring(riskATR, "#.##") + " ATR)" +
-         "\nT1 " + str.tostring(eT1, format.mintick) + "  T2 " + str.tostring(eT2, format.mintick) + "  T3 " + str.tostring(eT3, format.mintick) +
+    bxRisk := box.new(bar_index, math.max(eEntry, eStop), x2, math.min(eEntry, eStop), border_color = color.new(cBear, 55), bgcolor = color.new(cBear, 88), border_width = 1)
+    bxRwrd := box.new(bar_index, math.max(eEntry, eT3),  x2, math.min(eEntry, eT3),  border_color = color.new(cBull, 55), bgcolor = color.new(cBull, 91), border_width = 1)
+    lnEnt  := line.new(bar_index, eEntry, x2, eEntry, color = cNeut, style = line.style_solid,  width = 1)
+    lnT1   := line.new(bar_index, eT1,    x2, eT1,    color = color.new(cBull, 35), style = line.style_dotted, width = 1)
+    lnT2   := line.new(bar_index, eT2,    x2, eT2,    color = color.new(cBull, 35), style = line.style_dotted, width = 1)
+    lbSet  := label.new(x2, eEntry,
+         (eDir > 0 ? "▲ LONG  " : "▼ SHORT ") + str.tostring(eEntry, format.mintick) +
+         "\nstop " + str.tostring(eStop, format.mintick) + "   (" + str.tostring(riskATR, "#.##") + " ATR)" +
+         "\nT1 " + str.tostring(eT1, format.mintick) + "   T2 " + str.tostring(eT2, format.mintick) + "   T3 " + str.tostring(eT3, format.mintick) +
          "\nsize ≈ " + str.tostring(sizeUnits, "#.####") + " units",
          style = label.style_label_left, color = color.new(eDir > 0 ? cBull : cBear, 15), textcolor = color.white, size = size.small)
 
@@ -664,10 +684,11 @@ plot(slopeATR,  "Slope (ATR)", display = display.data_window)
 plot(distATR,   "Displacement (ATR)", display = display.data_window)
 
 // -----------------------------------------------------------------------------
-// 14 · TRANSPARENCY PANEL
-//      The point of this block: nothing in the score is a black box. Every
-//      factor shows its raw reading, its normalised bias, its weight and the
-//      exact number of points it contributed to the score on this bar.
+// 14 · DASHBOARD PANEL
+//      Nothing in the score is a black box: every factor shows its raw reading, its
+//      normalised bias, its weight and the exact points it contributed on this bar,
+//      and the PTS column sums to the score. Compact mode drops the breakdown and
+//      the context block for screens that cannot spare the height.
 // -----------------------------------------------------------------------------
 tablePos = tblPos == "Top left" ? position.top_left :
      tblPos == "Bottom right"   ? position.bottom_right :
@@ -679,7 +700,7 @@ color cHdr   = darkUI ? color.new(#2a2e39, 8)  : color.new(#e0e3eb, 8)
 color cTxt   = darkUI ? #d1d4dc : #131722
 color cDim   = darkUI ? #787b86 : #5d606b
 
-var table dash = table.new(tablePos, 5, 26, border_width = 1, frame_width = 1, frame_color = cHdr)
+var table dash = table.new(tablePos, 5, 28, border_width = 1, frame_width = 1, frame_color = cHdr)
 
 f_row(t, r, c0, c1, c2, c3, c4, col, bg) =>
     table.cell(t, 0, r, c0, text_color = cDim, bgcolor = bg, text_size = size.small, text_halign = text.align_left)
@@ -689,57 +710,83 @@ f_row(t, r, c0, c1, c2, c3, c4, col, bg) =>
     table.cell(t, 4, r, c4, text_color = col, bgcolor = bg, text_size = size.small, text_halign = text.align_right)
 
 if showPanel and barstate.islast
+    // Cleared every render so switching between Full and Compact cannot leave stale
+    // rows from the taller layout behind.
+    table.clear(dash, 0, 0, 4, 27)
+
+    bool  full    = panelMode == "Full · every factor"
     color cScore  = score > 15 ? cBull : score < -15 ? cBear : cNeut
     color cRegime = trendUp ? cBull : trendDn ? cBear : regime == "COMPRESSION" ? color.new(#f7a600, 0) : cNeut
+    int   r       = 0
 
-    f_row(dash, 0, "UNIVERSAL REGIME ENGINE", syminfo.ticker, "", timeframe.period, "", cTxt, cHdr)
-    f_row(dash, 1, "Confluence score", str.tostring(score, "#.#"), f_gauge(score / 100.0), "±100", str.tostring(wSum, "#.##") + "w", cScore, cPanel)
-    f_row(dash, 2, "Regime", regime, "", "bars", str.tostring(barsInRegime), cRegime, cPanel)
-    f_row(dash, 3, "Playbook", sigMode == "Auto (regime aware)" ? ((trendUp or trendDn) ? "continuation" : ranging ? "reversion" : "await expansion") : sigMode, "", "", "", cTxt, cPanel)
+    f_row(dash, r, "◆ " + panelTitle, syminfo.ticker, "", timeframe.period, "", cTxt, cHdr)
+    r += 1
+    f_row(dash, r, "Confluence score", str.tostring(score, "#.#"), f_gauge(score / 100.0), "±100", str.tostring(wSum, "#.##") + "w", cScore, cPanel)
+    r += 1
+    f_row(dash, r, "Regime", regime, "", "bars", str.tostring(barsInRegime), cRegime, cPanel)
+    r += 1
+    f_row(dash, r, "Playbook", sigMode == "Auto (regime aware)" ? ((trendUp or trendDn) ? "continuation" : ranging ? "reversion" : "await expansion") : sigMode, "", "", "", cTxt, cPanel)
+    r += 1
 
-    f_row(dash, 4, "FACTOR", "READING", "BIAS", "W", "PTS", cTxt, cHdr)
+    if full
+        f_row(dash, r, "FACTOR", "READING", "BIAS", "W", "PTS", cTxt, cHdr)
+        r += 1
 
-    array<string> fName = array.from("1 Trend slope", "2 Displacement", "3 Momentum (RSI)", "4 Directional", "5 Structure", "6 Volume flow", "7 HTF " + htfRes)
-    array<string> fRead = array.from(
-         str.tostring(slopeATR, "#.##") + " atr",
-         str.tostring(distATR, "#.##") + " atr",
-         str.tostring(rsi, "#.#"),
-         str.tostring(adxVal, "#.#") + " adx",
-         structEff > 0 ? "bullish" : structEff < 0 ? "bearish" : structDir != 0 ? "expired" : "none",
-         volUsable ? str.tostring(mfi, "#.#") : "n/a",
-         htfOn ? str.tostring(sHtf, "#.##") : "off")
-    array<float>  fBias = array.from(sTrend, sDist, sMom, sAdx, sStruct, sFlow, sHtf)
-    array<float>  fW    = array.from(wTrend, wDist, wMom, wAdx, wStruct, wFlow, wHtf)
-    array<bool>   fOk   = array.from(true, true, true, true, true, volUsable, htfOn)
+        array<string> fName = array.from("1 Trend slope", "2 Displacement", "3 Momentum (RSI)", "4 Directional", "5 Structure", "6 Volume flow", "7 HTF " + htfRes)
+        array<string> fRead = array.from(
+             str.tostring(slopeATR, "#.##") + " atr",
+             str.tostring(distATR, "#.##") + " atr",
+             str.tostring(rsi, "#.#"),
+             str.tostring(adxVal, "#.#") + " adx",
+             structEff > 0 ? "bullish" : structEff < 0 ? "bearish" : structDir != 0 ? "expired" : "none",
+             volUsable ? str.tostring(mfi, "#.#") : "n/a",
+             htfOn ? str.tostring(sHtf, "#.##") : "off")
+        array<float>  fBias = array.from(sTrend, sDist, sMom, sAdx, sStruct, sFlow, sHtf)
+        array<float>  fW    = array.from(wTrend, wDist, wMom, wAdx, wStruct, wFlow, wHtf)
+        array<bool>   fOk   = array.from(true, true, true, true, true, volUsable, htfOn)
 
-    for i = 0 to 6
-        float w   = array.get(fW, i)
-        bool  on  = w > 0 and array.get(fOk, i)
-        float b   = array.get(fBias, i)
-        float pts = on and wSum > 0 ? 100.0 * w * b / wSum : 0.0
-        color rc  = not on ? cDim : b > 0.05 ? cBull : b < -0.05 ? cBear : cNeut
-        f_row(dash, 5 + i, array.get(fName, i), on ? array.get(fRead, i) : "off",
-             on ? f_gauge(b) : "—", str.tostring(w, "#.##"), on ? str.tostring(pts, "#.#") : "—", rc, cPanel)
+        for i = 0 to 6
+            float w   = array.get(fW, i)
+            bool  on  = w > 0 and array.get(fOk, i)
+            float b   = array.get(fBias, i)
+            float pts = on and wSum > 0 ? 100.0 * w * b / wSum : 0.0
+            color rc  = not on ? cDim : b > 0.05 ? cBull : b < -0.05 ? cBear : cNeut
+            f_row(dash, r + i, array.get(fName, i), on ? array.get(fRead, i) : "off",
+                 on ? f_gauge(b) : "—", str.tostring(w, "#.##"), on ? str.tostring(pts, "#.#") : "—", rc, cPanel)
+        r += 7
 
-    f_row(dash, 12, "CONTEXT", "", "", "", "", cTxt, cHdr)
-    f_row(dash, 13, "ATR (volatility ruler)", str.tostring(atrPct, "#.##") + "%", f_gauge(volPct / 50.0 - 1.0), "pct", str.tostring(volPct, "#") , cTxt, cPanel)
-    f_row(dash, 14, "Squeeze", sqzOn ? "ON — coiled" : "off", "", "", "", sqzOn ? color.new(#f7a600, 0) : cDim, cPanel)
-    f_row(dash, 15, "Over-extension damp", str.tostring(damp * 100.0, "#") + "%", "", "stretch", str.tostring(stretch, "#.##"), damp < 1 ? color.new(#f7a600, 0) : cDim, cPanel)
-    f_row(dash, 16, "Volume feed", volUsable ? "usable" : "absent → factor dropped", "", "", "", volUsable ? cTxt : cDim, cPanel)
+        f_row(dash, r, "CONTEXT", "", "", "", "", cTxt, cHdr)
+        r += 1
+        f_row(dash, r, "ATR (volatility ruler)", str.tostring(atrPct, "#.##") + "%", f_gauge(volPct / 50.0 - 1.0), "pct", str.tostring(volPct, "#"), cTxt, cPanel)
+        r += 1
+        f_row(dash, r, "Squeeze", sqzOn ? "ON — coiled" : "off", "", "", "", sqzOn ? color.new(#f7a600, 0) : cDim, cPanel)
+        r += 1
+        f_row(dash, r, "Over-extension damp", str.tostring(damp * 100.0, "#") + "%", "", "stretch", str.tostring(stretch, "#.##"), damp < 1 ? color.new(#f7a600, 0) : cDim, cPanel)
+        r += 1
+        f_row(dash, r, "Volume feed", volUsable ? "usable" : "absent → factor dropped", "", "", "", volUsable ? cTxt : cDim, cPanel)
+        r += 1
 
-    f_row(dash, 17, "ACTIVE SETUP", "", "", "", "", cTxt, cHdr)
-    f_row(dash, 18, "Stance", stance > 0 ? "LONG" : stance < 0 ? "SHORT" : "flat", setupState, "since", na(eEntry) ? "—" : str.tostring(bar_index - lastSigBar) + "b", stance > 0 ? cBull : stance < 0 ? cBear : cDim, cPanel)
-    f_row(dash, 19, "Entry trigger",
+    f_row(dash, r, "ACTIVE SETUP", "", "", "", "", cTxt, cHdr)
+    r += 1
+    f_row(dash, r, "Entry trigger",
          armDir != 0 ? str.tostring(armLevel, format.mintick) : armState == "entry" ? "fired" : "—",
          armDir != 0 ? (armDir > 0 ? "break above" : "break below") : "",
          armDir != 0 and confirmMode ? "expires" : "",
          armDir != 0 and confirmMode ? str.tostring(math.max(0, armExpiry - armAge)) + "b" : "",
          armDir > 0 ? cBull : armDir < 0 ? cBear : armState == "entry" ? cTxt : cDim, cPanel)
-    f_row(dash, 20, "Entry", na(eEntry) ? "—" : str.tostring(eEntry, format.mintick), armState, "", "", cTxt, cPanel)
-    f_row(dash, 21, "Stop", na(eStop) ? "—" : str.tostring(eStop, format.mintick), "", "atr", na(riskATR) ? "—" : str.tostring(riskATR, "#.##"), cBear, cPanel)
-    f_row(dash, 22, "Targets 1 / 2 / 3", na(eT1) ? "—" : str.tostring(eT1, format.mintick) + " / " + str.tostring(eT2, format.mintick) + " / " + str.tostring(eT3, format.mintick), "", "R", str.tostring(rt1, "#.#") + "/" + str.tostring(rt2, "#.#") + "/" + str.tostring(rt3, "#.#"), cBull, cPanel)
-    f_row(dash, 23, sizeLabel, na(sizeUnits) ? "—" : str.tostring(sizeUnits, "#.####") + " units", "", "risk", sizeRisk, cTxt, cPanel)
-    f_row(dash, 24, closedOnly ? "Closed-bar signals" : "Intrabar signals (mutable)", htfStrict ? "HTF: closed bar" : "HTF: live bar", "", "", "", cDim, cPanel)
+    r += 1
+    f_row(dash, r, "Stance", stance > 0 ? "▲ LONG" : stance < 0 ? "▼ SHORT" : "flat", setupState, "since", na(eEntry) ? "—" : str.tostring(bar_index - lastSigBar) + "b", stance > 0 ? cBull : stance < 0 ? cBear : cDim, cPanel)
+    r += 1
+    f_row(dash, r, "Entry", na(eEntry) ? "—" : str.tostring(eEntry, format.mintick), "", "", "", cTxt, cPanel)
+    r += 1
+    f_row(dash, r, "Stop", na(eStop) ? "—" : str.tostring(eStop, format.mintick), "", "atr", na(riskATR) ? "—" : str.tostring(riskATR, "#.##"), cBear, cPanel)
+    r += 1
+    f_row(dash, r, "Targets 1 / 2 / 3", na(eT1) ? "—" : str.tostring(eT1, format.mintick) + " / " + str.tostring(eT2, format.mintick) + " / " + str.tostring(eT3, format.mintick), "", "R", str.tostring(rt1, "#.#") + "/" + str.tostring(rt2, "#.#") + "/" + str.tostring(rt3, "#.#"), cBull, cPanel)
+    r += 1
+    f_row(dash, r, sizeLabel, na(sizeUnits) ? "—" : str.tostring(sizeUnits, "#.####") + " units", "", "risk", sizeRisk, cTxt, cPanel)
+    r += 1
+    f_row(dash, r, closedOnly ? "Closed-bar signals" : "Intrabar signals (mutable)", htfStrict ? "HTF: closed bar" : "HTF: live bar", "", "", "", cDim, cPanel)
+    r += 1
 
 // -----------------------------------------------------------------------------
 // 15 · ALERTS

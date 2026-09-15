@@ -33,15 +33,6 @@
 //     The defaults are round numbers chosen because they are standard, not
 //     because they maximised a past P&L.
 //
-//  RUNNING IT ALONGSIDE THE INDICATOR
-//  ----------------------------------
-//  Both scripts draw the same chart layers. With both loaded and both set to draw,
-//  you get two adaptive MAs, two sets of structure lines, two sets of arrows and two
-//  panels stacked on each other. So the strategy's chart layers ship OFF and its
-//  panel sits in the opposite corner: the indicator owns the chart, the strategy
-//  adds its fills, its live stop/target levels and its own panel rows. Turn the
-//  layers back on in ⑦ Visuals if you run the strategy on its own.
-//
 //  This is a research / decision-support tool. It is not financial advice.
 // =============================================================================
 
@@ -542,22 +533,28 @@ toDate     = input.time(timestamp("1 Jan 2100 00:00 +0000"), "Backtest to", grou
 // Visual inputs live HERE, not in the shared engine, because the two scripts need
 // different defaults. Running the indicator and the strategy on one chart with the
 // same defaults draws two adaptive MAs, two sets of structure lines, two sets of
-// arrows and two panels stacked on each other — which looks like a bug and is
-// really just double-drawing. The indicator owns the chart, so the strategy ships
-// with its chart layers OFF and its panel in the opposite corner. Turn them on if
-// you run the strategy on its own.
-grpVis = "⑦ Visuals  ·  off by default so the indicator can own the chart"
-showMA     = input.bool(false, "Adaptive MA + envelope", group = grpVis, tooltip = "Leave off when the indicator is also on this chart — it already draws this.")
+// arrows — and two dashboard panels stacked on one screen. So the strategy ships
+// with its chart layers AND its panel off: the indicator is the display, the
+// strategy is the execution. Everything the strategy alone knows (position, P&L,
+// drawdown) is already in TradingView's Strategy Tester below the chart.
+// Running the strategy on its own? Turn these back on.
+grpVis = "⑦ Visuals  ·  off by default — the indicator owns the chart"
+panelMode  = input.string("Compact · essentials only", "Panel detail", options = ["Full · every factor", "Compact · essentials only"], group = grpVis)
+showPanel  = input.bool(false, "Dashboard panel", group = grpVis, tooltip = "OFF by default. The indicator already draws this panel, and two of them on one screen is clutter rather than information. Turn it on only if you run the strategy without the indicator.")
+tblPos     = input.string("Bottom right", "Panel position", options = ["Top right", "Top left", "Bottom right", "Bottom left", "Middle right"], group = grpVis, tooltip = "Opposite corner from the indicator, so that if you do enable both they still do not overlap.")
+darkUI     = input.bool(true, "Dark panel", group = grpVis)
+showMA     = input.bool(false, "Adaptive MA", group = grpVis, tooltip = "Leave off when the indicator is also on this chart — it already draws this.")
+showRibbon = input.bool(false, "Volatility ribbon", group = grpVis, tooltip = "Leave off when the indicator is also on this chart.")
+colorBars  = input.bool(false, "Colour bars by score", group = grpVis, tooltip = "Leave off when the indicator is also on this chart.")
 showStruct = input.bool(false, "Structure breaks (BOS / CHoCH)", group = grpVis, tooltip = "Leave off when the indicator is also on this chart.")
 showSig    = input.bool(false, "Signal + entry markers", group = grpVis, tooltip = "Leave off when the indicator is also on this chart. TradingView draws the strategy's own fills regardless.")
 showBg     = input.bool(false, "Shade compression regime", group = grpVis, tooltip = "Leave off when the indicator is also on this chart.")
-showRisk   = input.bool(true, "Live stop / target levels", group = grpVis, tooltip = "Safe to leave on — these track the OPEN trade, which the indicator does not draw.")
-showPanel  = input.bool(true, "Transparency panel", group = grpVis)
-tblPos     = input.string("Bottom right", "Panel position", options = ["Top right", "Top left", "Bottom right", "Bottom left", "Middle right"], group = grpVis, tooltip = "Defaults to the opposite corner from the indicator so the two panels do not overlap.")
-darkUI     = input.bool(true, "Dark panel", group = grpVis)
+showRisk   = input.bool(true, "Live stop / target of the OPEN trade", group = grpVis, tooltip = "Safe to leave on — this tracks the live position, which the indicator cannot know about.")
 cBull      = input.color(#089981, "Bull", inline = "col", group = grpVis)
 cBear      = input.color(#f23645, "Bear", inline = "col", group = grpVis)
 cNeut      = input.color(#787b86, "Neutral", inline = "col", group = grpVis)
+
+string panelTitle = "REGIME ENGINE · STRATEGY"
 
 // Presentation figures for the shared panel, computed from REAL strategy equity so
 // the panel can never advertise a size the script does not actually trade.
@@ -756,8 +753,9 @@ color trendCol = score > 15 ? cBull : score < -15 ? cBear : cNeut
 float kamaSig  = ta.ema(kama, math.max(2, erLen / 2))
 
 pMa  = plot(showMA ? kama : na, "Adaptive MA", color = trendCol, linewidth = 2)
-pSig = plot(showMA ? kamaSig : na, "MA envelope", color = color.new(trendCol, 55), linewidth = 1)
+pSig = plot(showRibbon ? kamaSig : na, "MA envelope", color = color.new(trendCol, 55), linewidth = 1)
 fill(pMa, pSig, color = color.new(trendCol, 88), title = "Trend envelope")
+barcolor(colorBars ? (score > entryTh ? cBull : score < -entryTh ? cBear : na) : na, title = "Score-coloured bars")
 
 bgcolor(showBg and sqzOn ? color.new(cNeut, 90) : na, title = "Compression")
 
@@ -797,10 +795,11 @@ plot(slopeATR, "Slope (ATR)", display = display.data_window)
 plot(distATR,  "Displacement (ATR)", display = display.data_window)
 
 // -----------------------------------------------------------------------------
-// 15 · TRANSPARENCY PANEL
-//      The point of this block: nothing in the score is a black box. Every
-//      factor shows its raw reading, its normalised bias, its weight and the
-//      exact number of points it contributed to the score on this bar.
+// 15 · DASHBOARD PANEL
+//      Nothing in the score is a black box: every factor shows its raw reading, its
+//      normalised bias, its weight and the exact points it contributed on this bar,
+//      and the PTS column sums to the score. Compact mode drops the breakdown and
+//      the context block for screens that cannot spare the height.
 // -----------------------------------------------------------------------------
 tablePos = tblPos == "Top left" ? position.top_left :
      tblPos == "Bottom right"   ? position.bottom_right :
@@ -822,60 +821,87 @@ f_row(t, r, c0, c1, c2, c3, c4, col, bg) =>
     table.cell(t, 4, r, c4, text_color = col, bgcolor = bg, text_size = size.small, text_halign = text.align_right)
 
 if showPanel and barstate.islast
+    // Cleared every render so switching between Full and Compact cannot leave stale
+    // rows from the taller layout behind.
+    table.clear(dash, 0, 0, 4, 27)
+
+    bool  full    = panelMode == "Full · every factor"
     color cScore  = score > 15 ? cBull : score < -15 ? cBear : cNeut
     color cRegime = trendUp ? cBull : trendDn ? cBear : regime == "COMPRESSION" ? color.new(#f7a600, 0) : cNeut
+    int   r       = 0
 
-    f_row(dash, 0, "REGIME ENGINE · STRATEGY", syminfo.ticker, "", timeframe.period, "", cTxt, cHdr)
-    f_row(dash, 1, "Confluence score", str.tostring(score, "#.#"), f_gauge(score / 100.0), "±100", str.tostring(wSum, "#.##") + "w", cScore, cPanel)
-    f_row(dash, 2, "Regime", regime, "", "bars", str.tostring(barsInRegime), cRegime, cPanel)
-    f_row(dash, 3, "Playbook", sigMode == "Auto (regime aware)" ? ((trendUp or trendDn) ? "continuation" : ranging ? "reversion" : "await expansion") : sigMode, "", "", "", cTxt, cPanel)
+    f_row(dash, r, "◆ " + panelTitle, syminfo.ticker, "", timeframe.period, "", cTxt, cHdr)
+    r += 1
+    f_row(dash, r, "Confluence score", str.tostring(score, "#.#"), f_gauge(score / 100.0), "±100", str.tostring(wSum, "#.##") + "w", cScore, cPanel)
+    r += 1
+    f_row(dash, r, "Regime", regime, "", "bars", str.tostring(barsInRegime), cRegime, cPanel)
+    r += 1
+    f_row(dash, r, "Playbook", sigMode == "Auto (regime aware)" ? ((trendUp or trendDn) ? "continuation" : ranging ? "reversion" : "await expansion") : sigMode, "", "", "", cTxt, cPanel)
+    r += 1
 
-    f_row(dash, 4, "FACTOR", "READING", "BIAS", "W", "PTS", cTxt, cHdr)
+    if full
+        f_row(dash, r, "FACTOR", "READING", "BIAS", "W", "PTS", cTxt, cHdr)
+        r += 1
 
-    array<string> fName = array.from("1 Trend slope", "2 Displacement", "3 Momentum (RSI)", "4 Directional", "5 Structure", "6 Volume flow", "7 HTF " + htfRes)
-    array<string> fRead = array.from(
-         str.tostring(slopeATR, "#.##") + " atr",
-         str.tostring(distATR, "#.##") + " atr",
-         str.tostring(rsi, "#.#"),
-         str.tostring(adxVal, "#.#") + " adx",
-         structEff > 0 ? "bullish" : structEff < 0 ? "bearish" : structDir != 0 ? "expired" : "none",
-         volUsable ? str.tostring(mfi, "#.#") : "n/a",
-         htfOn ? str.tostring(sHtf, "#.##") : "off")
-    array<float>  fBias = array.from(sTrend, sDist, sMom, sAdx, sStruct, sFlow, sHtf)
-    array<float>  fW    = array.from(wTrend, wDist, wMom, wAdx, wStruct, wFlow, wHtf)
-    array<bool>   fOk   = array.from(true, true, true, true, true, volUsable, htfOn)
+        array<string> fName = array.from("1 Trend slope", "2 Displacement", "3 Momentum (RSI)", "4 Directional", "5 Structure", "6 Volume flow", "7 HTF " + htfRes)
+        array<string> fRead = array.from(
+             str.tostring(slopeATR, "#.##") + " atr",
+             str.tostring(distATR, "#.##") + " atr",
+             str.tostring(rsi, "#.#"),
+             str.tostring(adxVal, "#.#") + " adx",
+             structEff > 0 ? "bullish" : structEff < 0 ? "bearish" : structDir != 0 ? "expired" : "none",
+             volUsable ? str.tostring(mfi, "#.#") : "n/a",
+             htfOn ? str.tostring(sHtf, "#.##") : "off")
+        array<float>  fBias = array.from(sTrend, sDist, sMom, sAdx, sStruct, sFlow, sHtf)
+        array<float>  fW    = array.from(wTrend, wDist, wMom, wAdx, wStruct, wFlow, wHtf)
+        array<bool>   fOk   = array.from(true, true, true, true, true, volUsable, htfOn)
 
-    for i = 0 to 6
-        float w   = array.get(fW, i)
-        bool  on  = w > 0 and array.get(fOk, i)
-        float b   = array.get(fBias, i)
-        float pts = on and wSum > 0 ? 100.0 * w * b / wSum : 0.0
-        color rc  = not on ? cDim : b > 0.05 ? cBull : b < -0.05 ? cBear : cNeut
-        f_row(dash, 5 + i, array.get(fName, i), on ? array.get(fRead, i) : "off",
-             on ? f_gauge(b) : "—", str.tostring(w, "#.##"), on ? str.tostring(pts, "#.#") : "—", rc, cPanel)
+        for i = 0 to 6
+            float w   = array.get(fW, i)
+            bool  on  = w > 0 and array.get(fOk, i)
+            float b   = array.get(fBias, i)
+            float pts = on and wSum > 0 ? 100.0 * w * b / wSum : 0.0
+            color rc  = not on ? cDim : b > 0.05 ? cBull : b < -0.05 ? cBear : cNeut
+            f_row(dash, r + i, array.get(fName, i), on ? array.get(fRead, i) : "off",
+                 on ? f_gauge(b) : "—", str.tostring(w, "#.##"), on ? str.tostring(pts, "#.#") : "—", rc, cPanel)
+        r += 7
 
-    f_row(dash, 12, "CONTEXT", "", "", "", "", cTxt, cHdr)
-    f_row(dash, 13, "ATR (volatility ruler)", str.tostring(atrPct, "#.##") + "%", f_gauge(volPct / 50.0 - 1.0), "pct", str.tostring(volPct, "#") , cTxt, cPanel)
-    f_row(dash, 14, "Squeeze", sqzOn ? "ON — coiled" : "off", "", "", "", sqzOn ? color.new(#f7a600, 0) : cDim, cPanel)
-    f_row(dash, 15, "Over-extension damp", str.tostring(damp * 100.0, "#") + "%", "", "stretch", str.tostring(stretch, "#.##"), damp < 1 ? color.new(#f7a600, 0) : cDim, cPanel)
-    f_row(dash, 16, "Volume feed", volUsable ? "usable" : "absent → factor dropped", "", "", "", volUsable ? cTxt : cDim, cPanel)
+        f_row(dash, r, "CONTEXT", "", "", "", "", cTxt, cHdr)
+        r += 1
+        f_row(dash, r, "ATR (volatility ruler)", str.tostring(atrPct, "#.##") + "%", f_gauge(volPct / 50.0 - 1.0), "pct", str.tostring(volPct, "#"), cTxt, cPanel)
+        r += 1
+        f_row(dash, r, "Squeeze", sqzOn ? "ON — coiled" : "off", "", "", "", sqzOn ? color.new(#f7a600, 0) : cDim, cPanel)
+        r += 1
+        f_row(dash, r, "Over-extension damp", str.tostring(damp * 100.0, "#") + "%", "", "stretch", str.tostring(stretch, "#.##"), damp < 1 ? color.new(#f7a600, 0) : cDim, cPanel)
+        r += 1
+        f_row(dash, r, "Volume feed", volUsable ? "usable" : "absent → factor dropped", "", "", "", volUsable ? cTxt : cDim, cPanel)
+        r += 1
 
-    f_row(dash, 17, "ACTIVE SETUP", "", "", "", "", cTxt, cHdr)
-    f_row(dash, 18, "Stance", stance > 0 ? "LONG" : stance < 0 ? "SHORT" : "flat", setupState, "since", na(eEntry) ? "—" : str.tostring(bar_index - lastSigBar) + "b", stance > 0 ? cBull : stance < 0 ? cBear : cDim, cPanel)
-    f_row(dash, 19, "Entry trigger",
+    f_row(dash, r, "ACTIVE SETUP", "", "", "", "", cTxt, cHdr)
+    r += 1
+    f_row(dash, r, "Entry trigger",
          armDir != 0 ? str.tostring(armLevel, format.mintick) : armState == "entry" ? "fired" : "—",
          armDir != 0 ? (armDir > 0 ? "break above" : "break below") : "",
          armDir != 0 and confirmMode ? "expires" : "",
          armDir != 0 and confirmMode ? str.tostring(math.max(0, armExpiry - armAge)) + "b" : "",
          armDir > 0 ? cBull : armDir < 0 ? cBear : armState == "entry" ? cTxt : cDim, cPanel)
-    f_row(dash, 20, "Entry", na(eEntry) ? "—" : str.tostring(eEntry, format.mintick), armState, "", "", cTxt, cPanel)
-    f_row(dash, 21, "Stop", na(eStop) ? "—" : str.tostring(eStop, format.mintick), "", "atr", na(riskATR) ? "—" : str.tostring(riskATR, "#.##"), cBear, cPanel)
-    f_row(dash, 22, "Targets 1 / 2 / 3", na(eT1) ? "—" : str.tostring(eT1, format.mintick) + " / " + str.tostring(eT2, format.mintick) + " / " + str.tostring(eT3, format.mintick), "", "R", str.tostring(rt1, "#.#") + "/" + str.tostring(rt2, "#.#") + "/" + str.tostring(rt3, "#.#"), cBull, cPanel)
-    f_row(dash, 23, sizeLabel, na(sizeUnits) ? "—" : str.tostring(sizeUnits, "#.####") + " units", "", "risk", sizeRisk, cTxt, cPanel)
-    f_row(dash, 24, closedOnly ? "Closed-bar signals" : "Intrabar signals (mutable)", htfStrict ? "HTF: closed bar" : "HTF: live bar", "", "", "", cDim, cPanel)
+    r += 1
+    f_row(dash, r, "Stance", stance > 0 ? "▲ LONG" : stance < 0 ? "▼ SHORT" : "flat", setupState, "since", na(eEntry) ? "—" : str.tostring(bar_index - lastSigBar) + "b", stance > 0 ? cBull : stance < 0 ? cBear : cDim, cPanel)
+    r += 1
+    f_row(dash, r, "Entry", na(eEntry) ? "—" : str.tostring(eEntry, format.mintick), "", "", "", cTxt, cPanel)
+    r += 1
+    f_row(dash, r, "Stop", na(eStop) ? "—" : str.tostring(eStop, format.mintick), "", "atr", na(riskATR) ? "—" : str.tostring(riskATR, "#.##"), cBear, cPanel)
+    r += 1
+    f_row(dash, r, "Targets 1 / 2 / 3", na(eT1) ? "—" : str.tostring(eT1, format.mintick) + " / " + str.tostring(eT2, format.mintick) + " / " + str.tostring(eT3, format.mintick), "", "R", str.tostring(rt1, "#.#") + "/" + str.tostring(rt2, "#.#") + "/" + str.tostring(rt3, "#.#"), cBull, cPanel)
+    r += 1
+    f_row(dash, r, sizeLabel, na(sizeUnits) ? "—" : str.tostring(sizeUnits, "#.####") + " units", "", "risk", sizeRisk, cTxt, cPanel)
+    r += 1
+    f_row(dash, r, closedOnly ? "Closed-bar signals" : "Intrabar signals (mutable)", htfStrict ? "HTF: closed bar" : "HTF: live bar", "", "", "", cDim, cPanel)
+    r += 1
 
-    f_row(dash, 25, "Position", strategy.position_size > 0 ? "LONG " + str.tostring(strategy.position_size, "#.####") : strategy.position_size < 0 ? "SHORT " + str.tostring(math.abs(strategy.position_size), "#.####") : "flat", "", "avg", strategy.position_size != 0 ? str.tostring(strategy.position_avg_price, format.mintick) : "—", strategy.position_size > 0 ? cBull : strategy.position_size < 0 ? cBear : cDim, cPanel)
-    f_row(dash, 26, "Open P&L", str.tostring(strategy.openprofit, "#.##"), "", "equity", str.tostring(strategy.equity, "#.##"), strategy.openprofit > 0 ? cBull : strategy.openprofit < 0 ? cBear : cDim, cPanel)
+    f_row(dash, r, "Position", strategy.position_size > 0 ? "▲ LONG " + str.tostring(strategy.position_size, "#.####") : strategy.position_size < 0 ? "▼ SHORT " + str.tostring(math.abs(strategy.position_size), "#.####") : "flat", "", "avg", strategy.position_size != 0 ? str.tostring(strategy.position_avg_price, format.mintick) : "—", strategy.position_size > 0 ? cBull : strategy.position_size < 0 ? cBear : cDim, cPanel)
+    r += 1
+    f_row(dash, r, "Open P&L", str.tostring(strategy.openprofit, "#.##"), "", "equity", str.tostring(strategy.equity, "#.##"), strategy.openprofit > 0 ? cBull : strategy.openprofit < 0 ? cBear : cDim, cPanel)
 
 // -----------------------------------------------------------------------------
 // 16 · ALERTS
