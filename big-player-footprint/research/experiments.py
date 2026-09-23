@@ -21,14 +21,14 @@ from datasets import load_all
 DATA = load_all()
 
 CONFIGS = {
-    "v1 defaults": dict(adaptive=False, rangeProxy=False),
-    "v2 defaults": {},
-    "v2 no gate": dict(adaptive=False),
-    "v2 no range": dict(rangeProxy=False),
-    "v2 htf cont": dict(htfGate="Continuation setups only"),
-    "v2 htf all": dict(htfGate="All setups"),
-    "v2 conv 70": dict(minConv=70),
-    "v2 confirm 0": dict(confirmN=0),
+    "v1 defaults": dict(adaptive=False, rangeProxy=False, liqLeft=10, minConv=60),
+    "Conservative": dict(liqLeft=10, minConv=60),
+    "Balanced": {},
+    "Active": dict(minConv=25, dispATR=1.2),
+    "Bal. no gate": dict(adaptive=False),
+    "Bal. no range": dict(rangeProxy=False),
+    "Bal. htf all": dict(htfGate="All setups"),
+    "Bal. confirm 0": dict(confirmN=0),
 }
 
 

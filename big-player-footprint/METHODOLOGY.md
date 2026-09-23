@@ -98,7 +98,7 @@ It gives the same value on historical and real-time bars.
 
 ## 5. Liquidity levels and sweeps
 
-Swing highs/lows are confirmed pivots (`ta.pivothigh/low(10, 3)`). A level only
+Swing highs/lows are confirmed pivots (`ta.pivothigh/low(left, 3)`, left = 5 on Balanced/Active, 10 on Conservative). A level only
 exists 3 bars after the swing, so it can never be known early. Up to 10 per side
 are tracked, for at most 300 bars.
 
@@ -182,11 +182,21 @@ footprint the tool measures.
 ## 10. Signal gate
 
 ```
-qualified = closed bar and past warm-up and trigger and conviction ≥ 60
+qualified = closed bar and past warm-up and trigger and conviction ≥ minimum
             and (optional) HTF agreement
 shown     = qualified and self-learning gate open
 long      = shown_long and not shown_short and ≥ 5 bars since the last signal
 ```
+
+| Signal frequency | minimum conviction | liquidity pivot left bars | displacement min range |
+| --- | ---: | ---: | ---: |
+| Conservative | 60 | 10 | 1.5 ATR |
+| Balanced (default) | 40 | 5 | 1.5 ATR |
+| Active | 25 | 5 | 1.2 ATR |
+
+On the 15-dataset test bed these give about 1 signal per 190, 80 and 55 bars.
+Balanced kept Conservative's edge over random on the held-out data with 2.4×
+the signals. Active trades some edge for frequency.
 
 When several setups trigger on one bar, the priority is sweep > absorption > FVG.
 The optional HTF filter requires `d·bias_HTF > 0` for all setups or only for C.

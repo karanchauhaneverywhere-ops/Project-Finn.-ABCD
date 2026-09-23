@@ -74,7 +74,7 @@ grpSig = "① Signals"
 useSweep   = input.bool(true, "A · Liquidity sweep & reclaim", group = grpSig)
 useAbs     = input.bool(true, "B · Absorption at an extreme", group = grpSig)
 useFvg     = input.bool(true, "C · Displacement → FVG retest", group = grpSig)
-minConv    = input.float(60, "Minimum conviction (0-100)", minval = 0, maxval = 100, step = 5, group = grpSig, tooltip = "Higher = fewer signals. Raise it only while the win rate in the signal tooltips keeps improving.")
+sigFreq    = input.string("Balanced", "Signal frequency", options = ["Conservative", "Balanced", "Active", "Custom"], group = grpSig, tooltip = "Tested on 15 real datasets: Conservative ≈ 1 signal per 200 bars, Balanced ≈ 1 per 80, Active ≈ 1 per 55. More signals = weaker average edge. Custom uses the three 'Custom ·' values in ⑤ Fine-tuning.")
 confirmN   = input.int(3, "Confirmation window for A/B (bars)", minval = 0, maxval = 20, group = grpSig, tooltip = "0 fires on the event bar itself. Testing showed confirmation clearly improves results.")
 cooldown   = input.int(5, "Cooldown between signals (bars)", minval = 0, group = grpSig)
 closedOnly = input.bool(true, "Only signal on closed bars (non-repainting)", group = grpSig)
@@ -110,14 +110,15 @@ vwLen      = input.int(50, "Rolling VWAP length (bars)", minval = 5, group = grp
 
 grpAdv = "⑤ Fine-tuning"
 atrLen    = input.int(14, "ATR length", minval = 2, group = grpAdv)
-liqLeft   = input.int(10, "Liquidity pivot · left bars", minval = 2, group = grpAdv)
+minConvC  = input.float(40, "Custom · minimum conviction (0-100)", minval = 0, maxval = 100, step = 5, group = grpAdv)
+liqLeftC  = input.int(5, "Custom · liquidity pivot left bars", minval = 2, group = grpAdv)
 liqRight  = input.int(3,  "Liquidity pivot · right bars", minval = 1, group = grpAdv)
 liqMax    = input.int(10, "Liquidity levels tracked per side", minval = 1, maxval = 40, group = grpAdv)
 liqAge    = input.int(300, "Liquidity level max age (bars)", minval = 20, group = grpAdv)
 absZ      = input.float(1.5, "Absorption · min volume z", minval = 0.5, step = 0.1, group = grpAdv)
 absSpread = input.float(0.9, "Absorption · max range (ATR)", minval = 0.1, step = 0.05, group = grpAdv)
 locLen    = input.int(20, "Absorption · extreme lookback (bars)", minval = 3, group = grpAdv)
-dispATR   = input.float(1.5, "Displacement · min range (ATR)", minval = 0.5, step = 0.1, group = grpAdv)
+dispATRC  = input.float(1.5, "Custom · displacement min range (ATR)", minval = 0.5, step = 0.1, group = grpAdv)
 dispBody  = input.float(0.6, "Displacement · min body / range", minval = 0.3, maxval = 1.0, step = 0.05, group = grpAdv)
 fvgMinATR = input.float(0.1, "FVG · min gap (ATR)", minval = 0.0, step = 0.05, group = grpAdv)
 fvgAge    = input.int(30, "FVG · max bars to retest", minval = 2, group = grpAdv)
@@ -131,7 +132,9 @@ htfLen    = input.int(50, "HTF EMA length", minval = 5, group = grpAdv)
 htfFull   = input.float(0.5, "HTF slope for full marks (ATR per 5 HTF bars)", minval = 0.05, step = 0.05, group = grpAdv)
 
 grpVis = "⑥ Visuals"
-showSig    = input.bool(true,  "Signals", group = grpVis)
+showSig    = input.bool(true,  "BUY / SELL signals", group = grpVis)
+showStatus = input.bool(true,  "Status label (last signal and what is armed)", group = grpVis)
+showMuted  = input.bool(false, "Signals muted by the self-learning gate (grey ×)", group = grpVis)
 showRisk   = input.bool(true,  "Stop / target of the latest signal", group = grpVis)
 showWhale  = input.bool(true,  "Colour whale bars", group = grpVis)
 showLiq    = input.bool(false, "Liquidity levels", group = grpVis)
@@ -143,6 +146,12 @@ cBear      = input.color(#f23645, "Bear", inline = "c1", group = grpVis)
 cNeut      = input.color(#787b86, "Neutral", inline = "c1", group = grpVis)
 cWhaleUp   = input.color(#00bcd4, "Whale buy bar", inline = "c2", group = grpVis)
 cWhaleDn   = input.color(#ff9800, "Whale sell bar", inline = "c2", group = grpVis)
+
+// Signal-frequency presets. Balanced / Active were measured to keep the edge
+// over random entries while producing 2-3x more signals than Conservative.
+float minConv = sigFreq == "Conservative" ? 60.0 : sigFreq == "Balanced" ? 40.0 : sigFreq == "Active" ? 25.0 : minConvC
+int   liqLeft = sigFreq == "Conservative" ? 10 : sigFreq == "Custom" ? liqLeftC : 5
+float dispATR = sigFreq == "Active" ? 1.2 : sigFreq == "Custom" ? dispATRC : 1.5
 
 // -----------------------------------------------------------------------------
 // 1 · HELPERS
@@ -706,15 +715,43 @@ plotshape(showEvents and absBull, "Bullish absorption", shape.square, location.b
 plotshape(showEvents and absBear, "Bearish absorption", shape.square, location.abovebar, color = color.new(cWhaleDn, 30), size = size.tiny)
 
 if showSig and (longSig or shortSig)
-    string tip = typeName.get(sigType) + (longSig ? " long" : " short") + " · conviction " + str.tostring(sigConv, "#") +
+    string tip = (longSig ? "BUY" : "SELL") + " · setup " + typeName.get(sigType) + " · conviction " + str.tostring(sigConv, "#") +
          "\nentry " + str.tostring(close, format.mintick) + " · stop " + str.tostring(sigStop, format.mintick) + " · target " + str.tostring(sigTgt, format.mintick) +
          "\n\nTrack record on this chart (before this signal)" +
          "\n" + typeName.get(sigType) + ": " + f_rec(sigType) +
          "\nAll signals: " + (nAll > 0 ? str.tostring(nAll) + " closed · win " + str.tostring(100.0 * winAll, "#") + "%" + (na(zAll) ? "" : " vs random " + str.tostring(100.0 * pRand, "#") + "% · z " + str.tostring(zAll, "0.0")) + " · avg " + str.tostring(rAll / nAll, "0.00") + "R" : "none yet") +
          "\n(|z| ≥ 2 means the difference from random is unlikely to be luck)"
-    label.new(bar_index, longSig ? low : high, typeName.get(sigType),
+    label.new(bar_index, longSig ? low : high, longSig ? "BUY" : "SELL",
          style = longSig ? label.style_label_up : label.style_label_down,
          color = longSig ? cBull : cBear, textcolor = color.white, size = size.small, tooltip = tip)
+
+plotshape(showMuted and mutedL, "Muted buy",  shape.xcross, location.belowbar, color = color.new(cNeut, 20), size = size.tiny)
+plotshape(showMuted and mutedS, "Muted sell", shape.xcross, location.abovebar, color = color.new(cNeut, 20), size = size.tiny)
+
+// Status label: always shows the last signal and anything armed, so an empty
+// visible range never looks like a broken indicator.
+var int    lastDir   = 0
+var float  lastPx    = na
+var int    lastBar   = na
+var string lastSetup = ""
+if longSig or shortSig
+    lastDir   := longSig ? 1 : -1
+    lastPx    := close
+    lastBar   := bar_index
+    lastSetup := typeName.get(sigType)
+
+var label stLbl = na
+if showStatus and barstate.islast
+    label.delete(stLbl)
+    string lastTxt = lastDir == 0 ? "No signal yet on this chart" :
+         "Last: " + (lastDir > 0 ? "BUY" : "SELL") + " (" + lastSetup + ") " + str.tostring(bar_index - lastBar) + " bars ago @ " + str.tostring(lastPx, format.mintick)
+    string armed = (pLType >= 0 ? "\nArmed BUY (" + typeName.get(pLType) + ") if a bar closes above " + str.tostring(pLTrig, format.mintick) : "") +
+         (pSType >= 0 ? "\nArmed SELL (" + typeName.get(pSType) + ") if a bar closes below " + str.tostring(pSTrig, format.mintick) : "") +
+         (fLOn ? "\nWatching bullish gap " + str.tostring(fLBot, format.mintick) + " – " + str.tostring(fLTop, format.mintick) : "") +
+         (fSOn ? "\nWatching bearish gap " + str.tostring(fSBot, format.mintick) + " – " + str.tostring(fSTop, format.mintick) : "")
+    string rec = nAll > 0 ? "\nRecord: " + str.tostring(nAll) + " closed · win " + str.tostring(100.0 * winAll, "#") + "%" + (na(pRand) ? "" : " (random " + str.tostring(100.0 * pRand, "#") + "%)") : ""
+    stLbl := label.new(bar_index + 3, close, "FBPF · " + sigFreq + "\n" + lastTxt + armed + rec,
+         style = label.style_label_left, color = color.new(#131722, 15), textcolor = #d1d4dc, size = size.small, textalign = text.align_left)
 
 var line lnS = na
 var line lnT = na

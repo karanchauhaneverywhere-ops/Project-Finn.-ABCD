@@ -1,7 +1,7 @@
 """Bar-by-bar Python port of indicators/Big_Player_Footprint.pine.
 
 Used to test the signal logic and the scoreboard outside TradingView on the
-real OHLCV test bed in datasets.py. Defaults mirror the Pine inputs.
+real OHLCV test bed in datasets.py. Defaults mirror the Pine inputs (signal frequency = Balanced).
 
 Known differences from TradingView: the higher timeframe is approximated by
 grouping chart bars, pivots use strict inequalities on both sides, and the
@@ -21,12 +21,12 @@ P = dict(
     # flow
     flowLen=20, flowFull=0.20, vwLen=50,
     # liquidity & setups
-    atrLen=14, liqLeft=10, liqRight=3, liqMax=10, liqAge=300,
+    atrLen=14, liqLeft=5, liqRight=3, liqMax=10, liqAge=300,
     useSweep=True, useAbs=True, useFvg=True,
     absZ=1.5, absSpread=0.9, locLen=20,
     dispATR=1.5, dispBody=0.6, fvgMinATR=0.1, fvgAge=30, confirmN=3,
     # conviction
-    wEff=30, wFlow=20, wHtf=20, wLoc=15, wLiq=15, minConv=60, liqCtx=20,
+    wEff=30, wFlow=20, wHtf=20, wLoc=15, wLiq=15, minConv=40, liqCtx=20,
     htfMult=4, htfLen=50, htfFull=0.5, cooldown=5,
     # accuracy features (Pine ② and ④)
     rangeProxy=True, adaptive=True, adMin=20, adWin=30,
