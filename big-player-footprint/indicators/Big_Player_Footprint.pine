@@ -1,0 +1,820 @@
+//@version=6
+// =============================================================================
+//  FINN · ABCD  ▸  BIG PLAYER FOOTPRINT   (FBPF)
+// -----------------------------------------------------------------------------
+//  WHAT THIS IS
+//  ------------
+//  Nobody can see *who* is trading from a price chart. What you CAN see is the
+//  mark a large order leaves on the tape, because size cannot hide completely:
+//
+//    * it needs VOLUME far above what is normal for this market at this time
+//    * it needs LIQUIDITY, so it goes where resting stops sit (beyond obvious
+//      swing highs / lows) and takes them
+//    * when it is PASSIVE (absorbing), heavy volume produces little movement
+//    * when it is AGGRESSIVE (initiating), it moves price further than normal
+//      in one bar and leaves an inefficiency (a fair-value gap) behind
+//    * over several bars its NET buying or selling shows up in the flow even
+//      when price has not moved yet (accumulation / distribution)
+//
+//  This script measures those five footprints, turns three of them into
+//  concrete setups, grades every setup with a 0-100 conviction score, and then
+//  — the part most indicators leave out — MEASURES ITS OWN ACCURACY on the
+//  chart you are looking at, against a random-entry baseline that uses the
+//  exact same stop, target and holding rules. You never have to take a win
+//  rate on trust: the panel shows it, and shows whether it beats chance.
+//
+//  THE THREE SETUPS
+//  ----------------
+//   A  LIQUIDITY SWEEP & RECLAIM  price runs a confirmed swing low (high),
+//                                 taking the stops parked there, and closes
+//                                 back inside. A large buyer (seller) filling
+//                                 against those stops leaves exactly this.
+//   B  ABSORPTION AT AN EXTREME   abnormally high volume, abnormally small
+//                                 range, at the edge of the recent range, and
+//                                 the close rejects the extreme. Effort with no
+//                                 result = someone passive is taking the other
+//                                 side of every order.
+//   C  DISPLACEMENT → FVG RETEST  a wide, full-bodied bar that leaves a three-
+//                                 bar fair-value gap (initiative), then the
+//                                 first return into that gap that closes back
+//                                 out of it in the original direction.
+//
+//   A and B must be CONFIRMED: within `confirmation window` bars price has to
+//   close beyond the event bar's far extreme, and the setup is cancelled if it
+//   closes beyond the near extreme first. Confirmation costs a little entry
+//   price and removes a large share of false events.
+//
+//  CONVICTION  (0 .. 100, weights are inputs)
+//  ------------------------------------------
+//   Effort     volume z-score of the EVENT bar, full marks at the whale level
+//   Flow       net signed volume over the flow window agrees with the trade
+//   HTF        the higher-timeframe trend agrees with the trade
+//   Location   reversals: buy below / sell above the rolling VWAP (discount /
+//              premium). Continuations: the opposite (trade with value).
+//   Liquidity  the opposite side's stops were swept within the context window
+//   A signal is only printed when conviction ≥ the minimum. Factors that
+//   cannot be measured (no volume feed, HTF off) are removed from the
+//   denominator instead of silently scoring zero.
+//
+//  VOLUME BASELINE
+//  ---------------
+//  "High volume" is a z-score of LOG volume (volume is heavily right-skewed;
+//  the log makes a z-score meaningful). On intraday charts the baseline is the
+//  SAME TIME OF DAY over the last N sessions — the open and the close are
+//  always busy, so comparing 09:30 volume with a 50-bar average flags every
+//  open as a whale. On daily and above a rolling baseline is used. The bar
+//  being measured is never part of its own baseline.
+//
+//  ORDER-FLOW ESTIMATE
+//  -------------------
+//  Default: bar approximation — signed volume = volume × close-location value
+//  ((close-low) - (high-close)) / (high-low). Optional: real intrabar up/down
+//  volume from a lower timeframe. The intrabar mode is more precise but
+//  TradingView only serves a limited number of intrabars, so older history
+//  falls back to the approximation; the panel reports the coverage.
+//
+//  REPAINTING POLICY
+//  -----------------
+//   * Signals are evaluated on CLOSED bars by default. A printed signal stays.
+//   * The higher timeframe is read as expr[1] with lookahead_on — the
+//     documented non-repainting form: always the last COMPLETED HTF bar.
+//   * Liquidity levels are confirmed pivots; they exist only after
+//     `right bars` have closed, so a level can never be "known" early.
+//   * The scoreboard enters at the signal bar's close and only uses bars that
+//     come after it. If a bar touches both stop and target, it is scored as a
+//     LOSS (the conservative assumption). Gaps through the stop are scored at
+//     the open, i.e. worse than -1R.
+//
+//  This is a research / decision-support tool. It is not financial advice and
+//  no indicator can identify a specific market participant.
+// =============================================================================
+
+indicator("Big Player Footprint [Finn]", shorttitle = "FBPF", overlay = true,
+     max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
+
+// -----------------------------------------------------------------------------
+// 0 · INPUTS
+// -----------------------------------------------------------------------------
+grpVol = "① Volume anomaly (effort)"
+volBase = input.string("Auto", "Volume baseline", options = ["Auto", "Rolling", "Time-of-day"], group = grpVol, tooltip = "Auto = time-of-day baseline on intraday charts, rolling baseline on daily and above.")
+volLen  = input.int(50, "Rolling baseline length (bars)", minval = 10, group = grpVol)
+todLen  = input.int(20, "Time-of-day memory (sessions)", minval = 5, group = grpVol)
+todMin  = input.int(10, "Time-of-day warm-up (sessions)", minval = 3, group = grpVol, tooltip = "Until a time slot has been seen this many times, the rolling baseline is used for it.")
+zWhale  = input.float(2.0, "Whale bar at volume z ≥", minval = 0.5, step = 0.1, group = grpVol)
+
+grpFlow = "② Order-flow estimate"
+deltaSrc = input.string("Bar approximation", "Delta source", options = ["Bar approximation", "Lower-timeframe intrabars"], group = grpFlow)
+flowLen  = input.int(20, "Net-delta window (bars)", minval = 3, group = grpFlow)
+flowFull = input.float(0.20, "Full flow score at net delta (fraction of volume)", minval = 0.02, step = 0.01, group = grpFlow)
+vwLen    = input.int(50, "Rolling VWAP length (bars)", minval = 5, group = grpFlow)
+
+grpSet = "③ Liquidity & setups"
+atrLen    = input.int(14, "ATR length", minval = 2, group = grpSet)
+liqLeft   = input.int(10, "Liquidity pivot · left bars", minval = 2, group = grpSet)
+liqRight  = input.int(3,  "Liquidity pivot · right bars (confirmation lag)", minval = 1, group = grpSet)
+liqMax    = input.int(10, "Tracked levels per side", minval = 1, maxval = 40, group = grpSet)
+liqAge    = input.int(300, "Level max age (bars)", minval = 20, group = grpSet)
+useSweep  = input.bool(true, "A · Liquidity sweep & reclaim", group = grpSet)
+useAbs    = input.bool(true, "B · Absorption at an extreme", group = grpSet)
+useFvg    = input.bool(true, "C · Displacement → FVG retest", group = grpSet)
+absZ      = input.float(1.5, "Absorption · min volume z", minval = 0.5, step = 0.1, group = grpSet)
+absSpread = input.float(0.9, "Absorption · max range (ATR)", minval = 0.1, step = 0.05, group = grpSet)
+locLen    = input.int(20, "Absorption · extreme lookback (bars)", minval = 3, group = grpSet)
+dispATR   = input.float(1.5, "Displacement · min range (ATR)", minval = 0.5, step = 0.1, group = grpSet)
+dispBody  = input.float(0.6, "Displacement · min body / range", minval = 0.3, maxval = 1.0, step = 0.05, group = grpSet)
+fvgMinATR = input.float(0.1, "FVG · min gap (ATR)", minval = 0.0, step = 0.05, group = grpSet)
+fvgAge    = input.int(30, "FVG · max bars to retest", minval = 2, group = grpSet)
+confirmN  = input.int(3, "Confirmation window for A/B (bars, 0 = fire on event bar)", minval = 0, maxval = 20, group = grpSet)
+
+grpConv = "④ Conviction · weights and gate"
+wEff    = input.float(30, "Effort · event-bar volume", minval = 0, group = grpConv)
+wFlow   = input.float(20, "Flow · net delta agrees", minval = 0, group = grpConv)
+wHtf    = input.float(20, "HTF trend agrees", minval = 0, group = grpConv)
+wLoc    = input.float(15, "Location · vs rolling VWAP", minval = 0, group = grpConv)
+wLiq    = input.float(15, "Liquidity · opposite stops just taken", minval = 0, group = grpConv)
+minConv = input.float(60, "Minimum conviction to print a signal", minval = 0, maxval = 100, step = 5, group = grpConv, tooltip = "Higher = fewer, cleaner signals. Watch the scoreboard: raise this until the win rate stops improving or the sample gets too small to trust.")
+liqCtx  = input.int(20, "Liquidity context window (bars)", minval = 1, group = grpConv)
+htfMode = input.string("Auto (chart × N)", "HTF", options = ["Auto (chart × N)", "Manual", "Off"], group = grpConv)
+htfMult = input.int(4, "Auto multiple", minval = 2, maxval = 24, group = grpConv)
+htfMan  = input.timeframe("D", "Manual timeframe", group = grpConv)
+htfLen  = input.int(50, "HTF EMA length", minval = 5, group = grpConv)
+htfFull = input.float(0.5, "HTF slope for full marks (ATR per 5 HTF bars)", minval = 0.05, step = 0.05, group = grpConv)
+cooldown   = input.int(5, "Cooldown between signals (bars)", minval = 0, group = grpConv)
+closedOnly = input.bool(true, "Only signal on closed bars (non-repainting)", group = grpConv)
+
+grpRisk = "⑤ Trade geometry & scoreboard"
+stopATR = input.float(1.5, "Stop distance (ATR)", minval = 0.1, step = 0.1, group = grpRisk)
+tgtR    = input.float(1.5, "Target (R multiple)", minval = 0.25, step = 0.25, group = grpRisk, tooltip = "Win rate and R are a trade-off: a 1R target wins more often than a 3R target. Judge the tool by average R and by its edge over the random baseline, not by win rate alone.")
+horizon = input.int(30, "Max holding (bars), then scored at market", minval = 2, group = grpRisk)
+useBase = input.bool(true, "Measure random-entry baseline", group = grpRisk)
+warmup  = input.int(100, "Warm-up bars (no signals, no scoring)", minval = 0, group = grpRisk)
+
+grpVis = "⑥ Visuals"
+showLiq    = input.bool(true, "Liquidity levels (stops resting)", group = grpVis)
+showFvg    = input.bool(true, "Fair-value gaps", group = grpVis)
+showWhale  = input.bool(true, "Colour whale bars", group = grpVis)
+showEvents = input.bool(true, "Raw events (sweeps / absorption)", group = grpVis)
+showVwap   = input.bool(true, "Rolling VWAP", group = grpVis)
+showSig    = input.bool(true, "Signals", group = grpVis)
+showRisk   = input.bool(true, "Stop / target of the latest signal", group = grpVis)
+showPanel  = input.bool(true, "Panel", group = grpVis)
+tblPos     = input.string("Top right", "Panel position", options = ["Top right", "Top left", "Bottom right", "Bottom left", "Middle right"], group = grpVis)
+darkUI     = input.bool(true, "Dark panel", group = grpVis)
+cBull      = input.color(#089981, "Bull", inline = "c1", group = grpVis)
+cBear      = input.color(#f23645, "Bear", inline = "c1", group = grpVis)
+cNeut      = input.color(#787b86, "Neutral", inline = "c1", group = grpVis)
+cWhaleUp   = input.color(#00bcd4, "Whale buy bar", inline = "c2", group = grpVis)
+cWhaleDn   = input.color(#ff9800, "Whale sell bar", inline = "c2", group = grpVis)
+
+// -----------------------------------------------------------------------------
+// 1 · HELPERS
+// -----------------------------------------------------------------------------
+f_clamp(v, lo, hi) => math.max(lo, math.min(hi, v))
+
+// Text gauge for the panel: -1 .. +1  ->  "◄ ███··" / "► ███··"
+f_gauge(v) =>
+    float c = f_clamp(v, -1.0, 1.0)
+    float n = math.abs(c) * 5.0
+    string s = ""
+    for i = 1 to 5
+        s := s + (i <= n + 0.5 ? "█" : "·")
+    (c < -0.02 ? "◄ " : c > 0.02 ? "► " : "· ") + s
+
+f_pct(num, den) => den > 0 ? str.tostring(100.0 * num / den, "#.#") + "%" : "—"
+
+// HTF trend: EMA slope over 5 bars, in ATR, so it is portable across markets.
+f_htfSlope() =>
+    float e = ta.ema(close, htfLen)
+    float a = ta.atr(14)
+    a > 0 ? (e - e[5]) / a : 0.0
+
+// -----------------------------------------------------------------------------
+// 2 · BAR ANATOMY
+// -----------------------------------------------------------------------------
+float atr   = ta.atr(atrLen)
+float rng   = high - low
+float body  = math.abs(close - open)
+// Close-location value: +1 = closed on the high, -1 = closed on the low.
+float clv   = rng > 0 ? ((close - low) - (high - close)) / rng : 0.0
+float vol   = nz(volume)
+bool  volOk = nz(ta.sma(vol, 20)) > 0
+float spreadATR = atr > 0 ? rng / atr : 0.0
+
+// -----------------------------------------------------------------------------
+// 3 · FOOTPRINT 1 — VOLUME ANOMALY (effort)
+//     z-score of log volume against a baseline that excludes the current bar.
+//     The 0.15 floor on the deviation stops a very quiet baseline from turning
+//     an ordinary bar into a "whale".
+// -----------------------------------------------------------------------------
+float lv    = math.log(vol + 1.0)
+float lvM   = ta.sma(lv, volLen)
+float lvS   = ta.stdev(lv, volLen)
+float zRoll = nz((lv - lvM[1]) / math.max(nz(lvS[1]), 0.15))
+
+bool  todWanted = volBase == "Time-of-day" or (volBase == "Auto" and timeframe.isintraday)
+float todA      = 2.0 / (todLen + 1.0)
+var map<int, float> todMean = map.new<int, float>()
+var map<int, float> todVar  = map.new<int, float>()
+var map<int, int>   todCnt  = map.new<int, int>()
+float zTod = na
+if todWanted and volOk
+    int slot = hour(time) * 60 + minute(time)
+    int cnt  = todCnt.contains(slot) ? todCnt.get(slot) : 0
+    // Score first, update second: the bar is never part of its own baseline.
+    if cnt >= todMin
+        zTod := (lv - todMean.get(slot)) / math.max(math.sqrt(todVar.get(slot)), 0.15)
+    if cnt == 0
+        todMean.put(slot, lv)
+        todVar.put(slot, 0.0)
+    else
+        float m0 = todMean.get(slot)
+        float d  = lv - m0
+        todMean.put(slot, m0 + todA * d)
+        todVar.put(slot, (1.0 - todA) * (todVar.get(slot) + todA * d * d))
+    todCnt.put(slot, cnt + 1)
+
+bool  todLive = not na(zTod)
+float vz      = not volOk ? 0.0 : todLive ? zTod : zRoll
+bool  whale   = volOk and vz >= zWhale
+
+// -----------------------------------------------------------------------------
+// 4 · FOOTPRINT 2 — ORDER-FLOW ESTIMATE (net delta)
+// -----------------------------------------------------------------------------
+int    chartSec = timeframe.in_seconds(timeframe.period)
+string ltfRes   = chartSec <= 60 ? timeframe.period : chartSec <= 3600 ? "1" : chartSec <= 14400 ? "5" : chartSec <= 86400 ? "15" : chartSec <= 604800 ? "60" : "240"
+[ltfD, ltfV] = request.security_lower_tf(syminfo.tickerid, ltfRes, [math.sign(close - open) * nz(volume), nz(volume)])
+
+bool  ltfHas   = deltaSrc == "Lower-timeframe intrabars" and not na(ltfV) and ltfV.size() > 0 and ltfV.sum() > 0
+float barDelta = ltfHas ? ltfD.sum() : clv * vol
+var int ltfBars = 0
+if ltfHas
+    ltfBars += 1
+
+float sumDelta = math.sum(barDelta, flowLen)
+float sumVol   = math.sum(vol, flowLen)
+// Net delta as a fraction of all volume traded in the window: -1 .. +1.
+float ndf      = nz(sumVol) > 0 ? nz(sumDelta) / sumVol : 0.0
+float pxMove   = atr > 0 ? (close - nz(close[flowLen], close)) / atr : 0.0
+// Divergence: flow is buying while price has not risen (or the reverse).
+bool  accum    = volOk and ndf >=  0.5 * flowFull and pxMove <= 0
+bool  distrib  = volOk and ndf <= -0.5 * flowFull and pxMove >= 0
+
+// Rolling VWAP — "value" as the volume actually traded it.
+float pvSum   = math.sum(hlc3 * vol, vwLen)
+float vSum    = math.sum(vol, vwLen)
+float smaHlc  = ta.sma(hlc3, vwLen)
+float rvwap   = volOk and nz(vSum) > 0 ? pvSum / vSum : smaHlc
+float vwapATR = atr > 0 and not na(rvwap) ? (close - rvwap) / atr : 0.0
+
+// -----------------------------------------------------------------------------
+// 5 · HIGHER-TIMEFRAME TREND  (expr[1] + lookahead_on = last CLOSED HTF bar)
+// -----------------------------------------------------------------------------
+bool   htfOn    = htfMode != "Off"
+string htfRes   = htfMode == "Manual" ? htfMan : timeframe.from_seconds(chartSec * htfMult)
+float  htfSlope = request.security(syminfo.tickerid, htfRes, f_htfSlope()[1], lookahead = barmerge.lookahead_on)
+float  sHtf     = htfOn ? f_clamp(nz(htfSlope) / htfFull, -1.0, 1.0) : 0.0
+
+// -----------------------------------------------------------------------------
+// 6 · FOOTPRINT 3 — LIQUIDITY POOLS AND SWEEPS
+//     Resting stops sit just beyond obvious swing highs (buy-side liquidity,
+//     BSL) and swing lows (sell-side liquidity, SSL). A level is removed the
+//     first time price trades through it; if that bar closes back inside, the
+//     level was SWEPT (stops taken, move rejected) rather than broken.
+// -----------------------------------------------------------------------------
+float ph = ta.pivothigh(high, liqLeft, liqRight)
+float pl = ta.pivotlow(low, liqLeft, liqRight)
+
+var array<float> bslLv  = array.new<float>()
+var array<int>   bslBar = array.new<int>()
+var array<line>  bslLn  = array.new<line>()
+var array<float> sslLv  = array.new<float>()
+var array<int>   sslBar = array.new<int>()
+var array<line>  sslLn  = array.new<line>()
+
+if not na(ph)
+    line ln = na
+    if showLiq
+        ln := line.new(bar_index - liqRight, ph, bar_index, ph, color = color.new(cBear, 45), style = line.style_dotted, extend = extend.right)
+    bslLv.push(ph)
+    bslBar.push(bar_index - liqRight)
+    bslLn.push(ln)
+    if bslLv.size() > liqMax
+        bslLv.shift()
+        bslBar.shift()
+        line.delete(bslLn.shift())
+if not na(pl)
+    line ln = na
+    if showLiq
+        ln := line.new(bar_index - liqRight, pl, bar_index, pl, color = color.new(cBull, 45), style = line.style_dotted, extend = extend.right)
+    sslLv.push(pl)
+    sslBar.push(bar_index - liqRight)
+    sslLn.push(ln)
+    if sslLv.size() > liqMax
+        sslLv.shift()
+        sslBar.shift()
+        line.delete(sslLn.shift())
+
+// Buy-side: a high above the level. Swept when the close is back below it.
+float sweptBsl = na
+int nB = bslLv.size()
+if nB > 0
+    for i = nB - 1 to 0
+        float lvl     = bslLv.get(i)
+        bool  taken   = high > lvl
+        bool  expired = bar_index - bslBar.get(i) > liqAge
+        if taken or expired
+            if taken and close < lvl
+                sweptBsl := na(sweptBsl) ? lvl : math.max(sweptBsl, lvl)
+            line ln = bslLn.get(i)
+            if not na(ln)
+                if taken
+                    line.set_x2(ln, bar_index)
+                    line.set_extend(ln, extend.none)
+                    line.set_style(ln, line.style_solid)
+                    line.set_color(ln, color.new(cNeut, 55))
+                else
+                    line.delete(ln)
+            bslLv.remove(i)
+            bslBar.remove(i)
+            bslLn.remove(i)
+
+// Sell-side: a low below the level. Swept when the close is back above it.
+float sweptSsl = na
+int nS = sslLv.size()
+if nS > 0
+    for i = nS - 1 to 0
+        float lvl     = sslLv.get(i)
+        bool  taken   = low < lvl
+        bool  expired = bar_index - sslBar.get(i) > liqAge
+        if taken or expired
+            if taken and close > lvl
+                sweptSsl := na(sweptSsl) ? lvl : math.min(sweptSsl, lvl)
+            line ln = sslLn.get(i)
+            if not na(ln)
+                if taken
+                    line.set_x2(ln, bar_index)
+                    line.set_extend(ln, extend.none)
+                    line.set_style(ln, line.style_solid)
+                    line.set_color(ln, color.new(cNeut, 55))
+                else
+                    line.delete(ln)
+            sslLv.remove(i)
+            sslBar.remove(i)
+            sslLn.remove(i)
+
+// The reclaim must be real: the close sits in the rejecting half of the bar.
+bool rawSweepBull = not na(sweptSsl) and clv >= 0.0
+bool rawSweepBear = not na(sweptBsl) and clv <= 0.0
+var int lastBullSweep = -100000
+var int lastBearSweep = -100000
+if rawSweepBull
+    lastBullSweep := bar_index
+if rawSweepBear
+    lastBearSweep := bar_index
+
+bool sweepBullEvt = useSweep and rawSweepBull
+bool sweepBearEvt = useSweep and rawSweepBear
+
+// -----------------------------------------------------------------------------
+// 7 · FOOTPRINT 4 — ABSORPTION  (effort without result, at an extreme)
+// -----------------------------------------------------------------------------
+float llPrev = ta.lowest(low, locLen)[1]
+float hhPrev = ta.highest(high, locLen)[1]
+bool  absorbing  = volOk and vz >= absZ and spreadATR <= absSpread
+bool  absBullEvt = useAbs and absorbing and low  <= llPrev + 0.25 * atr and clv >= 0.0
+bool  absBearEvt = useAbs and absorbing and high >= hhPrev - 0.25 * atr and clv <= 0.0
+
+// -----------------------------------------------------------------------------
+// 8 · FOOTPRINT 5 — DISPLACEMENT AND THE FAIR-VALUE GAP IT LEAVES
+//     Displacement bar = bar[1]. The gap is between bar[2] and bar[0].
+// -----------------------------------------------------------------------------
+bool dispBull  = rng[1] >= dispATR * atr[1] and close[1] > open[1] and body[1] >= dispBody * rng[1]
+bool dispBear  = rng[1] >= dispATR * atr[1] and close[1] < open[1] and body[1] >= dispBody * rng[1]
+bool newBullFvg = useFvg and dispBull and low  > high[2] and (low - high[2]) >= fvgMinATR * atr[1]
+bool newBearFvg = useFvg and dispBear and high < low[2]  and (low[2] - high) >= fvgMinATR * atr[1]
+
+var float fLTop = na
+var float fLBot = na
+var int   fLBar = na
+var float fLVz  = 0.0
+var bool  fLOn  = false
+var bool  fLHit = false
+var box   fLBox = na
+var float fSTop = na
+var float fSBot = na
+var int   fSBar = na
+var float fSVz  = 0.0
+var bool  fSOn  = false
+var bool  fSHit = false
+var box   fSBox = na
+
+bool fvgBullRetest = false
+bool fvgBearRetest = false
+
+// Progress the live gaps first (they were created on an earlier bar).
+if fLOn
+    if close < fLBot or bar_index - fLBar > fvgAge
+        fLOn := false
+    else
+        if low <= fLTop
+            fLHit := true
+        if fLHit and close > fLTop and close > open
+            fvgBullRetest := true
+            fLOn := false
+    if not na(fLBox)
+        box.set_right(fLBox, bar_index)
+if fSOn
+    if close > fSTop or bar_index - fSBar > fvgAge
+        fSOn := false
+    else
+        if high >= fSBot
+            fSHit := true
+        if fSHit and close < fSBot and close < open
+            fvgBearRetest := true
+            fSOn := false
+    if not na(fSBox)
+        box.set_right(fSBox, bar_index)
+
+// Then register new gaps (the newest gap replaces the one being watched).
+if newBullFvg
+    fLTop := low
+    fLBot := high[2]
+    fLBar := bar_index
+    fLVz  := vz[1]
+    fLOn  := true
+    fLHit := false
+    if showFvg
+        fLBox := box.new(bar_index - 2, fLTop, bar_index, fLBot, border_color = color.new(cBull, 70), bgcolor = color.new(cBull, 88))
+if newBearFvg
+    fSTop := low[2]
+    fSBot := high
+    fSBar := bar_index
+    fSVz  := vz[1]
+    fSOn  := true
+    fSHit := false
+    if showFvg
+        fSBox := box.new(bar_index - 2, fSTop, bar_index, fSBot, border_color = color.new(cBear, 70), bgcolor = color.new(cBear, 88))
+
+// -----------------------------------------------------------------------------
+// 9 · CONFIRMATION OF A / B
+//     Event bar arms a setup. Long: fires when a later bar closes above the
+//     event bar's HIGH within the window; cancelled if a bar closes below the
+//     event bar's LOW first, or the window runs out. Mirror for shorts.
+// -----------------------------------------------------------------------------
+var int   pLType = -1
+var float pLTrig = na
+var float pLInv  = na
+var int   pLBar  = na
+var float pLVz   = 0.0
+var int   pSType = -1
+var float pSTrig = na
+var float pSInv  = na
+var int   pSBar  = na
+var float pSVz   = 0.0
+
+int   trigLType = -1
+float trigLVz   = 0.0
+int   trigSType = -1
+float trigSVz   = 0.0
+
+if pLType >= 0
+    int age = bar_index - pLBar
+    if close > pLTrig
+        trigLType := pLType
+        trigLVz   := pLVz
+        pLType    := -1
+    else if close < pLInv or age >= confirmN
+        pLType := -1
+if pSType >= 0
+    int age = bar_index - pSBar
+    if close < pSTrig
+        trigSType := pSType
+        trigSVz   := pSVz
+        pSType    := -1
+    else if close > pSInv or age >= confirmN
+        pSType := -1
+
+int evtL = sweepBullEvt ? 0 : absBullEvt ? 1 : -1
+int evtS = sweepBearEvt ? 0 : absBearEvt ? 1 : -1
+if evtL >= 0
+    if confirmN == 0
+        if trigLType < 0
+            trigLType := evtL
+            trigLVz   := vz
+    else
+        pLType := evtL
+        pLTrig := high
+        pLInv  := low
+        pLBar  := bar_index
+        pLVz   := vz
+if evtS >= 0
+    if confirmN == 0
+        if trigSType < 0
+            trigSType := evtS
+            trigSVz   := vz
+    else
+        pSType := evtS
+        pSTrig := low
+        pSInv  := high
+        pSBar  := bar_index
+        pSVz   := vz
+
+// C fires straight from the retest (the retest close IS the confirmation).
+if trigLType < 0 and fvgBullRetest
+    trigLType := 2
+    trigLVz   := fLVz
+if trigSType < 0 and fvgBearRetest
+    trigSType := 2
+    trigSVz   := fSVz
+
+// -----------------------------------------------------------------------------
+// 10 · CONVICTION
+// -----------------------------------------------------------------------------
+float wAvail = (volOk ? wEff + wFlow : 0.0) + (htfOn ? wHtf : 0.0) + wLoc + wLiq
+
+f_conv(int dir, float evtVz, bool reversal) =>
+    float pts = 0.0
+    if volOk
+        pts += wEff  * f_clamp(evtVz / zWhale, 0.0, 1.0)
+        pts += wFlow * f_clamp(dir * ndf / flowFull, 0.0, 1.0)
+    if htfOn
+        pts += wHtf * f_clamp(dir * sHtf, 0.0, 1.0)
+    bool below = close < rvwap
+    bool locOk = reversal ? (dir > 0 ? below : not below) : (dir > 0 ? not below : below)
+    if locOk
+        pts += wLoc
+    bool liqOk = dir > 0 ? bar_index - lastBullSweep <= liqCtx : bar_index - lastBearSweep <= liqCtx
+    if liqOk
+        pts += wLiq
+    wAvail > 0 ? 100.0 * pts / wAvail : 0.0
+
+float convL = trigLType >= 0 ? f_conv(1,  trigLVz, trigLType != 2) : 0.0
+float convS = trigSType >= 0 ? f_conv(-1, trigSVz, trigSType != 2) : 0.0
+
+// -----------------------------------------------------------------------------
+// 11 · SIGNALS
+// -----------------------------------------------------------------------------
+bool barOk = (closedOnly ? barstate.isconfirmed : true) and bar_index >= warmup and nz(atr) > 0
+bool candL = barOk and trigLType >= 0 and convL >= minConv
+bool candS = barOk and trigSType >= 0 and convS >= minConv
+
+var int lastSig = -100000
+bool cooled   = bar_index - lastSig > cooldown
+bool longSig  = candL and not candS and cooled
+bool shortSig = candS and not candL and cooled
+if longSig or shortSig
+    lastSig := bar_index
+
+int   sigType = longSig ? trigLType : shortSig ? trigSType : -1
+float sigConv = longSig ? convL : shortSig ? convS : 0.0
+float riskPx  = stopATR * atr
+float sigStop = longSig ? close - riskPx : shortSig ? close + riskPx : na
+float sigTgt  = longSig ? close + tgtR * riskPx : shortSig ? close - tgtR * riskPx : na
+
+// -----------------------------------------------------------------------------
+// 12 · SCOREBOARD — the indicator grading itself
+//      Every signal becomes a virtual trade: entry at the signal close, stop
+//      `stopATR` ATR away, target `tgtR` × that. It is closed at the stop, the
+//      target, or at market after `horizon` bars. The baseline opens one long
+//      and one short on EVERY bar with the identical rules, so "win rate" can
+//      be compared with what this market gives away for free.
+//      Stats are indexed  type × 2 + side  (side 0 = long, 1 = short).
+// -----------------------------------------------------------------------------
+var array<float> sgE = array.new<float>()
+var array<float> sgS = array.new<float>()
+var array<float> sgT = array.new<float>()
+var array<int>   sgD = array.new<int>()
+var array<int>   sgB = array.new<int>()
+var array<int>   sgK = array.new<int>()
+var array<int>   stN = array.new<int>(6, 0)
+var array<int>   stW = array.new<int>(6, 0)
+var array<float> stR = array.new<float>(6, 0.0)
+
+var array<float> bsE = array.new<float>()
+var array<float> bsS = array.new<float>()
+var array<float> bsT = array.new<float>()
+var array<int>   bsD = array.new<int>()
+var array<int>   bsB = array.new<int>()
+var array<int>   bsK = array.new<int>()
+var array<int>   bnN = array.new<int>(2, 0)
+var array<int>   bnW = array.new<int>(2, 0)
+var array<float> bnR = array.new<float>(2, 0.0)
+
+f_resolve(array<float> aE, array<float> aS, array<float> aT, array<int> aD, array<int> aB, array<int> aK, array<int> cN, array<int> cW, array<float> cR) =>
+    int n = aE.size()
+    if n > 0
+        for i = n - 1 to 0
+            float e    = aE.get(i)
+            float s    = aS.get(i)
+            float t    = aT.get(i)
+            int   d    = aD.get(i)
+            float risk = math.abs(e - s)
+            float r    = na
+            bool  won  = false
+            if d > 0
+                if open <= s
+                    r := (open - e) / risk
+                else if low <= s
+                    r := -1.0
+                else if high >= t
+                    r   := (t - e) / risk
+                    won := true
+            else
+                if open >= s
+                    r := (e - open) / risk
+                else if high >= s
+                    r := -1.0
+                else if low <= t
+                    r   := (e - t) / risk
+                    won := true
+            if na(r) and bar_index - aB.get(i) >= horizon
+                r := d * (close - e) / risk
+            if not na(r)
+                int k = aK.get(i) * 2 + (d > 0 ? 0 : 1)
+                cN.set(k, cN.get(k) + 1)
+                if won
+                    cW.set(k, cW.get(k) + 1)
+                cR.set(k, cR.get(k) + r)
+                aE.remove(i)
+                aS.remove(i)
+                aT.remove(i)
+                aD.remove(i)
+                aB.remove(i)
+                aK.remove(i)
+    n
+
+if barstate.isconfirmed
+    // Resolve open trades on this bar first — a trade never uses its own entry bar.
+    f_resolve(sgE, sgS, sgT, sgD, sgB, sgK, stN, stW, stR)
+    f_resolve(bsE, bsS, bsT, bsD, bsB, bsK, bnN, bnW, bnR)
+    if longSig or shortSig
+        sgE.push(close)
+        sgS.push(sigStop)
+        sgT.push(sigTgt)
+        sgD.push(longSig ? 1 : -1)
+        sgB.push(bar_index)
+        sgK.push(sigType)
+    if useBase and bar_index >= warmup and nz(atr) > 0
+        for side = 0 to 1
+            int dd = side == 0 ? 1 : -1
+            bsE.push(close)
+            bsS.push(close - dd * riskPx)
+            bsT.push(close + dd * tgtR * riskPx)
+            bsD.push(dd)
+            bsB.push(bar_index)
+            bsK.push(0)
+
+// -----------------------------------------------------------------------------
+// 13 · VISUALS
+// -----------------------------------------------------------------------------
+plot(showVwap ? rvwap : na, "Rolling VWAP", color = color.new(cNeut, 30), linewidth = 1)
+barcolor(showWhale and whale ? (clv >= 0 ? cWhaleUp : cWhaleDn) : na, title = "Whale bar")
+
+plotshape(showEvents and sweepBullEvt, "SSL sweep", shape.circle,  location.belowbar, color = color.new(cBull, 35), size = size.tiny)
+plotshape(showEvents and sweepBearEvt, "BSL sweep", shape.circle,  location.abovebar, color = color.new(cBear, 35), size = size.tiny)
+plotshape(showEvents and absBullEvt,   "Bullish absorption", shape.square, location.belowbar, color = color.new(cWhaleUp, 30), size = size.tiny)
+plotshape(showEvents and absBearEvt,   "Bearish absorption", shape.square, location.abovebar, color = color.new(cWhaleDn, 30), size = size.tiny)
+
+array<string> typeName = array.from("SWEEP", "ABSORB", "FVG")
+
+if showSig and (longSig or shortSig)
+    string txt = (longSig ? "▲ " : "▼ ") + typeName.get(sigType) + "\n" + str.tostring(sigConv, "#")
+    label.new(bar_index, longSig ? low : high, txt, style = longSig ? label.style_label_up : label.style_label_down,
+         color = longSig ? cBull : cBear, textcolor = color.white, size = size.small,
+         tooltip = "conviction " + str.tostring(sigConv, "#.#") + " / 100" +
+             "\nentry " + str.tostring(close, format.mintick) +
+             "\nstop " + str.tostring(sigStop, format.mintick) +
+             "\ntarget " + str.tostring(sigTgt, format.mintick))
+
+var line  lnE = na
+var line  lnS = na
+var line  lnT = na
+if showRisk and (longSig or shortSig)
+    line.delete(lnE)
+    line.delete(lnS)
+    line.delete(lnT)
+    lnE := line.new(bar_index, close,   bar_index + horizon, close,   color = cNeut, width = 1)
+    lnS := line.new(bar_index, sigStop, bar_index + horizon, sigStop, color = cBear, style = line.style_dashed, width = 1)
+    lnT := line.new(bar_index, sigTgt,  bar_index + horizon, sigTgt,  color = cBull, style = line.style_dashed, width = 1)
+
+// Every intermediate value is inspectable in the Data Window.
+plot(vz,        "Volume z", display = display.data_window)
+plot(ndf,       "Net delta fraction", display = display.data_window)
+plot(pxMove,    "Price move over flow window (ATR)", display = display.data_window)
+plot(sHtf,      "HTF trend (-1..+1)", display = display.data_window)
+plot(vwapATR,   "Distance from VWAP (ATR)", display = display.data_window)
+plot(spreadATR, "Bar range (ATR)", display = display.data_window)
+plot(trigLType >= 0 ? convL : na, "Long conviction", display = display.data_window)
+plot(trigSType >= 0 ? convS : na, "Short conviction", display = display.data_window)
+
+// -----------------------------------------------------------------------------
+// 14 · PANEL
+// -----------------------------------------------------------------------------
+tablePos = tblPos == "Top left" ? position.top_left :
+     tblPos == "Bottom right"   ? position.bottom_right :
+     tblPos == "Bottom left"    ? position.bottom_left :
+     tblPos == "Middle right"   ? position.middle_right : position.top_right
+
+color cPanel = darkUI ? color.new(#131722, 12) : color.new(#ffffff, 8)
+color cHdr   = darkUI ? color.new(#2a2e39, 8)  : color.new(#e0e3eb, 8)
+color cTxt   = darkUI ? #d1d4dc : #131722
+color cDim   = darkUI ? #787b86 : #5d606b
+color cWarn  = #f7a600
+
+var table dash = table.new(tablePos, 5, 21, border_width = 1, frame_width = 1, frame_color = cHdr)
+
+f_row(t, r, c0, c1, c2, c3, c4, col, bg) =>
+    table.cell(t, 0, r, c0, text_color = cDim, bgcolor = bg, text_size = size.small, text_halign = text.align_left)
+    table.cell(t, 1, r, c1, text_color = col,  bgcolor = bg, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 2, r, c2, text_color = col,  bgcolor = bg, text_size = size.small, text_halign = text.align_left)
+    table.cell(t, 3, r, c3, text_color = cDim, bgcolor = bg, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 4, r, c4, text_color = col,  bgcolor = bg, text_size = size.small, text_halign = text.align_right)
+
+if showPanel and barstate.islast
+    // Live footprint
+    string effTxt = not volOk ? "no volume feed" :
+         absorbing ? "ABSORPTION" :
+         vz >= 1.0 and spreadATR >= dispATR ? "INITIATIVE" :
+         vz < 0 and spreadATR >= dispATR ? "no effort behind move" : "normal"
+    color effCol = effTxt == "ABSORPTION" ? cWarn : effTxt == "INITIATIVE" ? (clv >= 0 ? cBull : cBear) : cDim
+    string divTxt = accum ? "ACCUMULATION" : distrib ? "DISTRIBUTION" : "flow ≈ price"
+    color  divCol = accum ? cBull : distrib ? cBear : cDim
+
+    float nearBsl = na
+    float nearSsl = na
+    if bslLv.size() > 0
+        for i = 0 to bslLv.size() - 1
+            float v = bslLv.get(i)
+            if v > close and (na(nearBsl) or v < nearBsl)
+                nearBsl := v
+    if sslLv.size() > 0
+        for i = 0 to sslLv.size() - 1
+            float v = sslLv.get(i)
+            if v < close and (na(nearSsl) or v > nearSsl)
+                nearSsl := v
+
+    string watchL = pLType >= 0 ? typeName.get(pLType) + " long > " + str.tostring(pLTrig, format.mintick) : fLOn ? "FVG long " + str.tostring(fLBot, format.mintick) + "–" + str.tostring(fLTop, format.mintick) : "—"
+    string watchS = pSType >= 0 ? typeName.get(pSType) + " short < " + str.tostring(pSTrig, format.mintick) : fSOn ? "FVG short " + str.tostring(fSBot, format.mintick) + "–" + str.tostring(fSTop, format.mintick) : "—"
+
+    f_row(dash, 0, "BIG PLAYER FOOTPRINT", syminfo.ticker, "", timeframe.period, "", cTxt, cHdr)
+    f_row(dash, 1, "LIVE FOOTPRINT", "READING", "", "", "", cTxt, cHdr)
+    f_row(dash, 2, "Volume z (effort)", str.tostring(vz, "#.##"), f_gauge(vz / zWhale), todLive ? "t-o-d" : "rolling", whale ? "WHALE" : "", whale ? cWarn : cTxt, cPanel)
+    f_row(dash, 3, "Effort vs result", effTxt, "", "range", str.tostring(spreadATR, "#.##") + " atr", effCol, cPanel)
+    f_row(dash, 4, "Net delta " + str.tostring(flowLen) + "b", str.tostring(ndf * 100.0, "#.#") + "%", f_gauge(ndf / flowFull), ltfHas ? "intrabar" : "approx", "", ndf > 0 ? cBull : ndf < 0 ? cBear : cDim, cPanel)
+    f_row(dash, 5, "Flow vs price", divTxt, "", "px", str.tostring(pxMove, "#.##") + " atr", divCol, cPanel)
+    f_row(dash, 6, "HTF trend " + (htfOn ? htfRes : "off"), htfOn ? str.tostring(sHtf, "#.##") : "—", htfOn ? f_gauge(sHtf) : "", "", "", sHtf > 0 ? cBull : sHtf < 0 ? cBear : cDim, cPanel)
+    f_row(dash, 7, "vs rolling VWAP", vwapATR >= 0 ? "premium" : "discount", "", "", str.tostring(vwapATR, "#.##") + " atr", cTxt, cPanel)
+    f_row(dash, 8, "Stops above / below", na(nearBsl) ? "—" : str.tostring(nearBsl, format.mintick), "", "", na(nearSsl) ? "—" : str.tostring(nearSsl, format.mintick), cTxt, cPanel)
+    f_row(dash, 9, "Watching", watchL, "", "", watchS, cTxt, cPanel)
+
+    // Scoreboard
+    f_row(dash, 10, "SCOREBOARD (this chart)", "SIGNALS", "WIN %", "AVG R", "vs RANDOM", cTxt, cHdr)
+    int   bNall = bnN.get(0) + bnN.get(1)
+    float bWall = bNall > 0 ? (bnW.get(0) + bnW.get(1)) * 1.0 / bNall : na
+    for k = 0 to 2
+        int   n  = stN.get(k * 2) + stN.get(k * 2 + 1)
+        int   w  = stW.get(k * 2) + stW.get(k * 2 + 1)
+        float rr = stR.get(k * 2) + stR.get(k * 2 + 1)
+        float wr = n > 0 ? w * 1.0 / n : na
+        string edge = n > 0 and not na(bWall) ? str.tostring((wr - bWall) * 100.0, "+#.#;-#.#") + " pp" : "—"
+        color  ec   = n > 0 and not na(bWall) ? (wr > bWall ? cBull : cBear) : cDim
+        f_row(dash, 11 + k, array.get(array.from("A Sweep & reclaim", "B Absorption", "C FVG retest"), k), str.tostring(n), f_pct(w, n), n > 0 ? str.tostring(rr / n, "+#.##;-#.##") : "—", edge, ec, cPanel)
+
+    for side = 0 to 1
+        int   n  = stN.get(side) + stN.get(2 + side) + stN.get(4 + side)
+        int   w  = stW.get(side) + stW.get(2 + side) + stW.get(4 + side)
+        float rr = stR.get(side) + stR.get(2 + side) + stR.get(4 + side)
+        int   bn = bnN.get(side)
+        float p0 = bn > 0 ? bnW.get(side) * 1.0 / bn : na
+        float wr = n > 0 ? w * 1.0 / n : na
+        // One-sample z of the signal win rate against the baseline win rate.
+        float z  = n > 0 and not na(p0) and p0 > 0 and p0 < 1 ? (wr - p0) / math.sqrt(p0 * (1.0 - p0) / n) : na
+        string zt = na(z) ? "—" : "z " + str.tostring(z, "+#.#;-#.#") + (math.abs(z) >= 2 ? " ✓" : "")
+        f_row(dash, 14 + side, side == 0 ? "All longs" : "All shorts", str.tostring(n), f_pct(w, n), n > 0 ? str.tostring(rr / n, "+#.##;-#.##") : "—", zt, na(z) ? cDim : z >= 2 ? cBull : z <= -2 ? cBear : cTxt, cPanel)
+
+    for side = 0 to 1
+        int bn = bnN.get(side)
+        f_row(dash, 16 + side, side == 0 ? "Random long, every bar" : "Random short, every bar", str.tostring(bn), f_pct(bnW.get(side), bn), bn > 0 ? str.tostring(bnR.get(side) / bn, "+#.##;-#.##") : "—", useBase ? "baseline" : "off", cDim, cPanel)
+
+    f_row(dash, 18, "Geometry", "stop " + str.tostring(stopATR, "#.##") + " atr", "tgt " + str.tostring(tgtR, "#.##") + "R", "max " + str.tostring(horizon) + "b", "b/e " + str.tostring(100.0 / (1.0 + tgtR), "#.#") + "%", cDim, cPanel)
+    f_row(dash, 19, "Min conviction " + str.tostring(minConv, "#"), closedOnly ? "closed bars" : "INTRABAR", "", "", deltaSrc == "Lower-timeframe intrabars" ? "intrabar " + f_pct(ltfBars, bar_index + 1) : "", closedOnly ? cDim : cWarn, cPanel)
+    f_row(dash, 20, volOk ? "Volume feed usable" : "NO VOLUME — effort & flow dropped", "", "", "", "", volOk ? cDim : cWarn, cPanel)
+
+// -----------------------------------------------------------------------------
+// 15 · ALERTS
+// -----------------------------------------------------------------------------
+alertcondition(longSig,  "FBPF · Long signal",  "FBPF LONG {{ticker}} {{interval}} @ {{close}}")
+alertcondition(shortSig, "FBPF · Short signal", "FBPF SHORT {{ticker}} {{interval}} @ {{close}}")
+alertcondition(whale and barstate.isconfirmed, "FBPF · Whale bar", "FBPF whale volume {{ticker}} {{interval}}")
+alertcondition(rawSweepBull, "FBPF · Sell-side liquidity swept", "FBPF SSL sweep {{ticker}} {{interval}}")
+alertcondition(rawSweepBear, "FBPF · Buy-side liquidity swept", "FBPF BSL sweep {{ticker}} {{interval}}")
+alertcondition(accum and not accum[1], "FBPF · Accumulation", "FBPF accumulation {{ticker}} {{interval}}")
+alertcondition(distrib and not distrib[1], "FBPF · Distribution", "FBPF distribution {{ticker}} {{interval}}")
+
+if longSig or shortSig
+    alert((longSig ? "FBPF LONG " : "FBPF SHORT ") + syminfo.ticker + " " + timeframe.period +
+         " | setup " + typeName.get(sigType) +
+         " | conviction " + str.tostring(sigConv, "#") +
+         " | entry " + str.tostring(close, format.mintick) +
+         " | stop " + str.tostring(sigStop, format.mintick) +
+         " | target " + str.tostring(sigTgt, format.mintick), alert.freq_once_per_bar_close)
