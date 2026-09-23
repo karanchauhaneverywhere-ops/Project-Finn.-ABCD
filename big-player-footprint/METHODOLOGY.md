@@ -45,16 +45,33 @@ var'  = (1 − α)·(var_slot + α·d²)
 A slot is used only after 10 observations. Until then, the rolling z is used.
 **Whale bar:** `z ≥ 2.0`.
 
+**Borrowed volume.** With *Borrow volume from* on, `volume` is taken from another
+symbol at the chart timeframe with `gaps_on`. A bar the other symbol did not
+trade then counts as zero instead of repeating the previous value.
+
+**No volume feed.** When the 20-bar average volume is zero and the range proxy is
+on, effort is measured with the same two baselines on
+
+```
+lr = ln(TR / close × 10 000 + 1)          # true range in basis points of price
+```
+
+A bar that moves far more than usual for this market and time of day is the
+only effort evidence a volume-less feed can give. Absorption needs real volume
+and never fires on the proxy. Flow is dropped from conviction.
+
 ## 3. Net flow
 
 Signed volume per bar:
 
 * **Bar approximation** (default): `delta = CLV × volume`. This is the
   standard close-location split of a bar's volume into buying and selling.
-* **Intrabar** (optional): `delta = Σ sign(close − open) × volume` over
-  lower-timeframe bars (1m for charts up to 1h, 5m up to 4h, 15m up to 1D, 60m up
-  to 1W). TradingView limits how many intrabars it serves, so older bars fall
-  back to the approximation. The panel reports coverage.
+* **Intrabar** (optional): `delta = (Σ sign(close − open) × v / Σ v) × volume`
+  over lower-timeframe bars (1m for charts up to 1h, 5m up to 4h, 15m up to 1D,
+  60m up to 1W). The intrabar share is applied to the chart's volume, so the
+  scale stays right even when volume is borrowed. TradingView limits how many
+  intrabars it serves, so older bars fall back to the approximation. When the
+  mode is off, the request asks for the chart timeframe, which costs nothing.
 
 ```
 NDF    = Σ(delta, 20) / Σ(volume, 20)             # −1 … +1, share of volume that was net buying
@@ -70,7 +87,7 @@ i.e. "value".
 ## 4. Higher-timeframe trend
 
 ```
-HTF       = chart × 4 (Auto), or manual
+HTF       = chart × 4 (Auto, capped at 12 months), or manual
 slope     = (EMA(close, 50) − EMA(close, 50)[5]) / ATR(14)      # on the HTF
 read as     request.security(..., slope[1], lookahead_on)     # last CLOSED HTF bar
 bias_HTF  = clamp(slope / 0.5, −1, 1)
@@ -143,7 +160,7 @@ For a candidate in direction `d` (+1 / −1):
 
 | Factor | Weight | Points |
 | --- | ---: | --- |
-| Effort | 30 | `clamp(z_event / 2.0, 0, 1)`: volume of the **event** bar (sweep/absorption bar, or the displacement bar for C) |
+| Effort | 30 | `clamp(z_event / 2.0, 0, 1)`: effort z of the **event** bar (sweep/absorption bar, or the displacement bar for C) |
 | Flow | 20 | `clamp(d·NDF / 0.20, 0, 1)` |
 | HTF | 20 | `clamp(d·bias_HTF, 0, 1)` |
 | Location | 15 | reversal setups (A, B): long below VWAP / short above. Continuation (C): long above / short below |
@@ -153,8 +170,10 @@ For a candidate in direction `d` (+1 / −1):
 conviction = 100 × Σ points / Σ weights of AVAILABLE factors
 ```
 
-Without volume, Effort and Flow leave both sums. With HTF off, HTF leaves
-both sums. A missing measurement therefore does not score as disagreement.
+Without volume, Flow leaves both sums. Effort stays, measured on the range
+proxy, unless that proxy is turned off, in which case Effort leaves both sums
+too. With HTF off, HTF leaves both sums. A missing measurement therefore does
+not score as disagreement.
 
 A sweep setup always earns the Liquidity points, because the sweep *is* the
 opposite side's stops being taken. That is intended: it is the most direct
@@ -163,42 +182,69 @@ footprint the tool measures.
 ## 10. Signal gate
 
 ```
-long  = closed bar and past warm-up and trigger_long  and conviction_long  ≥ 60
-        and not (short also qualifies) and ≥ 5 bars since the last signal
+qualified = closed bar and past warm-up and trigger and conviction ≥ 60
+            and (optional) HTF agreement
+shown     = qualified and self-learning gate open
+long      = shown_long and not shown_short and ≥ 5 bars since the last signal
 ```
 
 When several setups trigger on one bar, the priority is sweep > absorption > FVG.
+The optional HTF filter requires `d·bias_HTF > 0` for all setups or only for C.
+In testing it did not improve both halves of the data, so it is off by default.
 
-## 11. Scoreboard
+## 11. Virtual trades
 
-Every signal becomes a virtual trade:
+Every trade uses the same geometry:
 
 ```
-entry  = signal close
+entry  = close of the bar that opened it
 stop   = entry ∓ 1.5·ATR                        (R = 1.5·ATR)
 target = entry ± 1.5·R
 ```
 
-It is resolved on each **later** bar, in this order:
+It is resolved on each **later** confirmed bar, in this order:
 
 1. open already beyond the stop → exit at the open (can be worse than −1R)
 2. bar touches the stop → −1R (so a bar touching both counts as a **loss**)
 3. bar touches the target → +1.5R, counted as a win
 4. 30 bars elapsed → exit at the close, R = signed move / risk (not a win)
 
-**Baseline.** From the end of warm-up, every bar opens one long and one short
-with the identical rules. That is the unconditional win rate this market gave
-away over the same period, including its drift. The signal rows compare
-against it:
+Three books use these rules:
+
+| Book | Opened for | Used for |
+| --- | --- | --- |
+| signals | every signal shown | the track record in tooltips and the Data Window |
+| random | one long and one short on every bar after warm-up | the baseline |
+| shadow | every *qualified* candidate, shown or not | the self-learning gate |
+
+All open trades are resolved **before** the current bar's signals are decided.
+
+## 12. Self-learning gate
+
+For each setup `k` (sweep, absorption, FVG):
 
 ```
-edge (pp) = win%_signals − win%_random
-z         = (p̂ − p₀) / √(p₀(1 − p₀)/n)        p₀ = random win rate, n = signals
+closed_k  = shadow outcomes of k that have closed
+recent_k  = the last 30 of their R values
+gate open = closed_k < 20  or  Σ recent_k > 0
 ```
 
-|z| < 2 cannot be told apart from luck at conventional confidence. The
-break-even win rate for a target of R is `1 / (1 + R)`, before costs and
-ignoring timed-out trades.
+The gate only reads trades that have already closed, so it cannot see the
+future. Because the shadow book keeps recording muted setups, a setup that
+starts working again re-opens by itself. It exists because the tests showed the
+three setups do not work equally well in every market. This lets each chart
+decide instead of hard-coding one set of setups.
 
-No commissions or slippage are modelled. Subtract your own costs, in R,
-from the average R.
+## 13. Track record and baseline
+
+```
+win%        = wins / closed signals
+random win% = random win rate per side, weighted by the signals' long/short mix
+z           = (win% − random win%) / √(p₀(1 − p₀)/n)        p₀ = random win%, n = signals
+```
+
+The random book includes the market's drift over the same period, so a
+long-only edge in a bull market is not mistaken for skill. |z| < 2 cannot be
+told apart from luck at conventional confidence. The break-even win rate for a
+target of R is `1 / (1 + R)`, before costs and ignoring timed-out trades. No
+commissions or slippage are modelled.
