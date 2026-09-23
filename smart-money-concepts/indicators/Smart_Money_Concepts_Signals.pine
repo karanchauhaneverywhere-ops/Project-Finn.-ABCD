@@ -1,0 +1,796 @@
+//@version=6
+// =============================================================================
+//  FINN · ABCD  ▸  SMART MONEY CONCEPTS SIGNALS   (FSMC)
+// -----------------------------------------------------------------------------
+//  WHAT THIS IS
+//  ------------
+//  A rule-based ("algorithmic") version of the Smart Money Concepts entry
+//  model. Every step a discretionary SMC trader performs by eye is written down
+//  as an exact rule, so the same chart always produces the same BUY / SELL
+//  calls — no judgement, no hindsight:
+//
+//    1  LIQUIDITY     every confirmed swing high / low is a liquidity pool. A
+//                     wick through a pool that closes back inside is a SWEEP.
+//    2  STRUCTURE     a candle CLOSE beyond the last swing is a structure break.
+//                     Against the prior trend it is a CHoCH (change of
+//                     character); with the trend it is a BOS (break of
+//                     structure). Wicks never count as breaks.
+//    3  DISPLACEMENT  the break must be driven by a strong candle (body ≥ k·ATR)
+//                     or leave a fair value gap. Slow, drifting breaks are
+//                     ignored — they are how retail gets trapped.
+//    4  ORDER BLOCK   the last opposite-colour candle at the origin of the
+//                     breaking leg. That is the zone price has to come back to.
+//    5  DISCOUNT      longs only in the lower half of the dealing range
+//                     (discount), shorts only in the upper half (premium).
+//    6  CONFIRMATION  price taps the order block and a candle closes back in
+//                     the trade direction. That close is the BUY / SELL call.
+//    7  HTF BIAS      the higher-timeframe structure must point the same way.
+//
+//  GRADING  —  three optional confluences, one point each:
+//     · a liquidity sweep at the origin of the breaking leg
+//     · a fair value gap inside the breaking leg (real displacement)
+//     · a deep entry: ≥ 61.8 % retracement of the dealing range (OTE)
+//  A+ = 3/3, A = 2/3, B = 1/3. "Minimum grade" drops everything below it.
+//
+//  RISK  —  stop beyond the most extreme price since the order-block origin
+//  plus an ATR buffer; targets at 1R / 2R / 3R. One call is open at a time: a
+//  new call in the same direction waits, an opposite call reverses.
+//
+//  HONEST SCOREBOARD  —  every call is followed bar by bar until its stop, its
+//  last target or a reversal. The panel shows how many calls reached TP1 / TP2
+//  / TP3, the net result in R and the profit factor ON THE CHART YOU ARE
+//  LOOKING AT. When a bar touches both the stop and a target the stop is
+//  assumed to have filled first, so the numbers err on the pessimistic side.
+//
+//  WHY IT PORTS ACROSS MARKETS AND TIMEFRAMES
+//  ------------------------------------------
+//  Every size (displacement, gap, zone height, stop buffer, stop limits) is
+//  measured in ATR, and every lookback is in bars. Nothing is expressed in an
+//  instrument's own price units, so the defaults behave the same on a 5-digit
+//  FX pair, an index, a stock or a 6-figure crypto pair.
+//
+//  REPAINTING POLICY
+//  -----------------
+//   * Everything is decided on bar close (barstate.isconfirmed). A printed call
+//     never disappears and a live bar never flashes one.
+//   * Swing points confirm `swing length` bars after they form, so structure
+//     updates late, never early. That lag is inherent to swings and disclosed.
+//   * The HTF bias reads the last CLOSED higher-timeframe bar (expression[1]
+//     with lookahead_on — TradingView's documented non-repainting form).
+//   * Order-block boxes start at the order-block candle in the past, but they
+//     are created on the bar the break confirmed, from data known on that bar.
+//
+//  This is a research / decision-support tool. It is not financial advice.
+// =============================================================================
+
+indicator("Smart Money Concepts Signals [Finn]", shorttitle = "FSMC", overlay = true,
+     max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500, max_bars_back = 500)
+
+// -----------------------------------------------------------------------------
+// 0 · INPUTS
+// -----------------------------------------------------------------------------
+grpStr = "① Market structure"
+swingLen = input.int(5, "Swing length (bars each side)", minval = 2, maxval = 50, group = grpStr, tooltip = "A swing high needs this many lower highs on each side (and vice versa). Larger = fewer, more significant swings, so fewer but bigger calls.")
+atrLen   = input.int(14, "ATR length", minval = 2, group = grpStr, tooltip = "Every size in this script is measured in ATR, which is what lets one set of defaults work on any market and timeframe.")
+breakUse = input.string("CHoCH + BOS", "Trade which breaks", options = ["CHoCH + BOS", "CHoCH only (reversals)", "BOS only (continuations)"], group = grpStr)
+
+grpZone = "② Order block & entry"
+dispMult = input.float(1.0, "Displacement: candle body ≥ (ATR)", minval = 0.2, step = 0.1, group = grpZone, tooltip = "The breaking leg needs one candle with a body at least this large, or a fair value gap. Weak, drifting breaks are ignored.")
+fvgMin   = input.float(0.1, "Fair value gap: min size (ATR)", minval = 0, step = 0.05, group = grpZone)
+zoneUse  = input.string("Order block", "Entry zone", options = ["Order block", "Order block or FVG"], group = grpZone, tooltip = "Order block = deeper entries, tighter stops, fewer calls. Order block or FVG = price only has to reach the fair value gap, which usually sits above the order block.")
+obMaxH   = input.float(1.5, "Max zone height (ATR)", minval = 0.2, step = 0.1, group = grpZone)
+pdLimit  = input.float(50.0, "Enter only in discount / premium (% of range)", minval = 10, maxval = 100, step = 5, group = grpZone, tooltip = "50 = longs only below the equilibrium of the dealing range, shorts only above it. 100 switches the filter off.")
+maxWait  = input.int(30, "Setup expires after (bars)", minval = 3, group = grpZone)
+
+grpQ = "③ Signal quality"
+minGrade  = input.string("A (2/3)", "Minimum grade", options = ["A+ (3/3)", "A (2/3)", "B (1/3)", "Any"], group = grpQ, tooltip = "Confluences: liquidity sweep at the origin · FVG in the breaking leg · deep (OTE) entry. A higher grade gives fewer, cleaner calls.")
+oteLvl    = input.float(38.2, "Deep entry (OTE) at ≤ (% of range)", minval = 5, maxval = 50, step = 0.1, group = grpQ, tooltip = "38.2 % of the range measured from the origin = a 61.8 % retracement, the start of the optimal trade entry band.")
+htfMode   = input.string("Auto (chart × 4)", "Higher-timeframe bias", options = ["Auto (chart × 4)", "Manual", "Off"], group = grpQ, tooltip = "Auto derives the HTF from the chart: 5m→20m, 15m→1H, 1H→4H, 1D→4D.")
+htfManual = input.timeframe("240", "Manual timeframe", group = grpQ, tooltip = "Pick a timeframe higher than the chart.")
+
+grpRisk = "④ Stop & targets"
+stopBuf  = input.float(0.25, "Stop buffer beyond the extreme (ATR)", minval = 0, step = 0.05, group = grpRisk)
+minRisk  = input.float(0.5, "Min stop distance (ATR)", minval = 0.1, step = 0.1, group = grpRisk)
+maxRisk  = input.float(3.0, "Skip calls with a stop wider than (ATR)", minval = 0.5, step = 0.25, group = grpRisk)
+rr1      = input.float(1.0, "TP1 (R)", minval = 0.25, step = 0.25, group = grpRisk, inline = "tp")
+rr2      = input.float(2.0, "TP2", minval = 0.25, step = 0.25, group = grpRisk, inline = "tp")
+rr3      = input.float(3.0, "TP3", minval = 0.25, step = 0.25, group = grpRisk, inline = "tp")
+beAfter1 = input.bool(true, "Move stop to breakeven after TP1", group = grpRisk)
+
+grpVis = "⑤ Visuals"
+showSig    = input.bool(true, "BUY / SELL labels", group = grpVis)
+showLevels = input.bool(true, "Entry, stop & targets of the open call", group = grpVis)
+showZones  = input.bool(true, "Order blocks, FVGs & entry limit of armed setups", group = grpVis)
+showStruct = input.bool(true, "BOS / CHoCH", group = grpVis)
+showLiq    = input.bool(false, "Liquidity pools & sweeps", group = grpVis)
+colorBars  = input.bool(false, "Colour candles by structure", group = grpVis)
+showPanel  = input.bool(true, "Panel", group = grpVis)
+tblPos     = input.string("Top right", "Panel position", options = ["Top right", "Top left", "Bottom right", "Bottom left", "Middle right"], group = grpVis)
+darkUI     = input.bool(true, "Dark panel", group = grpVis)
+cBull      = input.color(#089981, "Bull", inline = "col", group = grpVis)
+cBear      = input.color(#f23645, "Bear", inline = "col", group = grpVis)
+cNeut      = input.color(#787b86, "Neutral", inline = "col", group = grpVis)
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  ENGINE  ·  sections 1–7 are shared verbatim with
+//  "Smart Money Concepts Strategy [Finn]", so the backtest trades exactly the
+//  calls this indicator prints.
+// ═════════════════════════════════════════════════════════════════════════════
+
+// -----------------------------------------------------------------------------
+// 1 · CONSTANTS, TYPES, HELPERS
+// -----------------------------------------------------------------------------
+int MAX_SCAN  = 300   // longest leg (bars) the break scan will look back over
+int OB_SEARCH = 3     // bars before the leg's extreme searched for the order-block candle
+int MAX_POOLS = 10    // liquidity pools remembered per side
+
+// An armed setup: a confirmed, displaced break whose order block has not been
+// retested yet.
+type Setup
+    bool  armed  = false
+    int   brkBar
+    int   obBar
+    float top
+    float bot
+    bool  hasFvg = false
+    float fvgTop
+    float fvgBot
+    int   fvgBar
+    bool  sweep  = false
+    bool  choch  = false
+    float rngLo
+    float rngHi
+    float ext
+    int   touch
+    box   zBox
+    box   fBox
+    line  eqLn
+
+// The call currently being followed (dir = 0 once it is resolved).
+type Call
+    int    dir   = 0
+    float  entry
+    float  stop
+    float  risk
+    float  t1
+    float  t2
+    float  t3
+    int    hits  = 0
+    int    bar
+    string grade = ""
+
+// Scoreboard of every resolved call on this chart.
+type Book
+    int   calls = 0
+    int   t1    = 0
+    int   t2    = 0
+    int   t3    = 0
+    float net   = 0.0
+    float won   = 0.0
+    float lost  = 0.0
+
+// Realised R of a call scaled out in equal thirds at TP1 / TP2 / TP3, whatever
+// is still open being closed at exitR (the stop, breakeven or a reversal).
+method record(Book b, int hits, float exitR) =>
+    float r = (hits >= 1 ? rr1 : 0.0) / 3.0 + (hits >= 2 ? rr2 : 0.0) / 3.0 + (hits >= 3 ? rr3 : 0.0) / 3.0 + (3 - hits) / 3.0 * exitR
+    b.calls += 1
+    b.t1    += hits >= 1 ? 1 : 0
+    b.t2    += hits >= 2 ? 1 : 0
+    b.t3    += hits >= 3 ? 1 : 0
+    b.net   += r
+    if r > 0
+        b.won  += r
+    else
+        b.lost -= r
+    r
+
+f_grade(g) => g >= 3 ? "A+" : g == 2 ? "A" : g == 1 ? "B" : "C"
+
+// Seconds -> a timeframe string TradingView accepts, so the HTF can be derived
+// from whatever chart is open.
+f_tfString(secs) =>
+    string r = "D"
+    if secs < 60
+        r := str.tostring(math.max(1, math.round(secs)), "#") + "S"
+    else if secs < 86400
+        r := str.tostring(math.max(1, math.round(secs / 60.0)), "#")
+    else if secs < 604800
+        r := str.tostring(math.max(1, math.round(secs / 86400.0)), "#") + "D"
+    else if secs < 2419200
+        r := str.tostring(math.max(1, math.round(secs / 604800.0)), "#") + "W"
+    else
+        r := str.tostring(math.max(1, math.round(secs / 2592000.0)), "#") + "M"
+    r
+
+// Structure direction (+1 / −1) of whatever timeframe this is evaluated on:
+// the same swing and close-beyond-swing rules as the chart engine. Evaluated
+// through request.security for the higher-timeframe bias.
+f_structDir(len, shift) =>
+    var float sh  = na
+    var float sl  = na
+    var int   dir = 0
+    float hp = ta.pivothigh(high, len, len)
+    float lp = ta.pivotlow(low, len, len)
+    if not na(hp)
+        sh := hp
+    if not na(lp)
+        sl := lp
+    bool up = not na(sh) and close > sh
+    bool dn = not na(sl) and close < sl
+    if up and (not dn or close >= open)
+        dir := 1
+        sh  := na
+    else if dn
+        dir := -1
+        sl  := na
+    dir[shift]
+
+// -----------------------------------------------------------------------------
+// 2 · PRIMITIVES
+// -----------------------------------------------------------------------------
+bool  bc  = barstate.isconfirmed     // every decision is taken on a closed bar
+float atr = ta.atr(atrLen)
+float ph  = ta.pivothigh(high, swingLen, swingLen)
+float pl  = ta.pivotlow(low, swingLen, swingLen)
+
+int  gradeMin   = minGrade == "A+ (3/3)" ? 3 : minGrade == "A (2/3)" ? 2 : minGrade == "B (1/3)" ? 1 : 0
+bool useFvgZone = zoneUse == "Order block or FVG"
+
+// -----------------------------------------------------------------------------
+// 3 · LIQUIDITY POOLS & SWEEPS
+//     Buy-side liquidity (stops of shorts, breakout buys) rests above swing
+//     highs; sell-side below swing lows. A pool is consumed the first time price
+//     trades through it. If that bar closes back inside, it was a SWEEP — a stop
+//     run — rather than a genuine break.
+// -----------------------------------------------------------------------------
+var array<float> bslLvl = array.new<float>()
+var array<line>  bslLn  = array.new<line>()
+var array<float> sslLvl = array.new<float>()
+var array<line>  sslLn  = array.new<line>()
+var int lastBslSweep = na
+var int lastSslSweep = na
+bool bslSweptNow = false
+bool sslSweptNow = false
+
+if bc
+    if array.size(bslLvl) > 0
+        for i = array.size(bslLvl) - 1 to 0
+            float lvl = array.get(bslLvl, i)
+            line  ln  = array.get(bslLn, i)
+            if high > lvl
+                if close < lvl
+                    bslSweptNow  := true
+                    lastBslSweep := bar_index
+                if not na(ln)
+                    line.set_x2(ln, bar_index)
+                array.remove(bslLvl, i)
+                array.remove(bslLn, i)
+            else if not na(ln)
+                line.set_x2(ln, bar_index)
+    if array.size(sslLvl) > 0
+        for i = array.size(sslLvl) - 1 to 0
+            float lvl = array.get(sslLvl, i)
+            line  ln  = array.get(sslLn, i)
+            if low < lvl
+                if close > lvl
+                    sslSweptNow  := true
+                    lastSslSweep := bar_index
+                if not na(ln)
+                    line.set_x2(ln, bar_index)
+                array.remove(sslLvl, i)
+                array.remove(sslLn, i)
+            else if not na(ln)
+                line.set_x2(ln, bar_index)
+    if not na(ph)
+        array.push(bslLvl, ph)
+        array.push(bslLn, showLiq ? line.new(bar_index - swingLen, ph, bar_index, ph, color = color.new(cBear, 45), style = line.style_dotted) : na)
+        if array.size(bslLvl) > MAX_POOLS
+            array.shift(bslLvl)
+            line.delete(array.shift(bslLn))
+    if not na(pl)
+        array.push(sslLvl, pl)
+        array.push(sslLn, showLiq ? line.new(bar_index - swingLen, pl, bar_index, pl, color = color.new(cBull, 45), style = line.style_dotted) : na)
+        if array.size(sslLvl) > MAX_POOLS
+            array.shift(sslLvl)
+            line.delete(array.shift(sslLn))
+
+// -----------------------------------------------------------------------------
+// 4 · HIGHER-TIMEFRAME BIAS
+// -----------------------------------------------------------------------------
+bool   htfOn  = htfMode != "Off"
+string htfRes = htfMode == "Manual" ? htfManual : f_tfString(timeframe.in_seconds(timeframe.period) * 4.0)
+int    htfRaw = request.security(syminfo.tickerid, htfRes, f_structDir(swingLen, 1), lookahead = barmerge.lookahead_on)
+int    htfDir = htfOn ? nz(htfRaw) : 0
+
+// -----------------------------------------------------------------------------
+// 5 · CALL TRACKER — follow the open call against this bar
+//     Stop is checked before targets: when one bar spans both, the stop is
+//     assumed to have filled first. A gap through the stop fills at the open.
+// -----------------------------------------------------------------------------
+var Call cur  = Call.new()
+var Book book = Book.new()
+string evText = ""
+
+// Levels as they stood coming into this bar (what the chart plots).
+bool  wasOpen = cur.dir != 0 and bar_index > nz(cur.bar)
+float pEntry  = cur.entry
+float pStop   = cur.stop
+float pT1     = cur.t1
+float pT2     = cur.t2
+float pT3     = cur.t3
+
+if bc and wasOpen
+    bool  done  = false
+    float exitR = 0.0
+    if cur.dir == 1
+        if low <= cur.stop
+            done  := true
+            exitR := (math.min(open, cur.stop) - cur.entry) / cur.risk
+        else
+            if cur.hits < 1 and high >= cur.t1
+                cur.hits := 1
+                evText   := "TP1 hit"
+                if beAfter1
+                    cur.stop := cur.entry
+            if cur.hits < 2 and high >= cur.t2
+                cur.hits := 2
+                evText   := "TP2 hit"
+            if cur.hits < 3 and high >= cur.t3
+                cur.hits := 3
+                evText   := "TP3 hit — call complete"
+                done     := true
+    else
+        if high >= cur.stop
+            done  := true
+            exitR := (cur.entry - math.max(open, cur.stop)) / cur.risk
+        else
+            if cur.hits < 1 and low <= cur.t1
+                cur.hits := 1
+                evText   := "TP1 hit"
+                if beAfter1
+                    cur.stop := cur.entry
+            if cur.hits < 2 and low <= cur.t2
+                cur.hits := 2
+                evText   := "TP2 hit"
+            if cur.hits < 3 and low <= cur.t3
+                cur.hits := 3
+                evText   := "TP3 hit — call complete"
+                done     := true
+    if done
+        if cur.hits < 3
+            evText := cur.hits == 0 ? "stopped out" : "stopped after TP" + str.tostring(cur.hits) + (beAfter1 ? " (breakeven)" : "")
+        book.record(cur.hits, exitR)
+        cur.dir := 0
+
+// -----------------------------------------------------------------------------
+// 6 · ARMED SETUPS — wait for the retest of the order block
+//     Runs before new setups are captured, so a setup can still fire on the
+//     bar a newer break replaces it.
+// -----------------------------------------------------------------------------
+var Setup bull = Setup.new()
+var Setup bear = Setup.new()
+bool   bullNew = false
+bool   bearNew = false
+bool   bullEnd = false
+bool   bearEnd = false
+string bullWhy = ""
+string bearWhy = ""
+
+bool  longTrig  = false
+bool  shortTrig = false
+float longPd    = na
+float shortPd   = na
+
+if bc and bull.armed and bar_index > bull.brkBar
+    bull.rngHi := math.max(bull.rngHi, high)
+    bull.ext   := math.min(bull.ext, low)
+    float effTop = useFvgZone and bull.hasFvg ? math.max(bull.top, bull.fvgTop) : bull.top
+    if low <= effTop
+        bull.touch := bar_index
+    float rng = bull.rngHi - bull.rngLo
+    longPd := rng > 0 ? (close - bull.rngLo) / rng * 100.0 : 100.0
+    if close < bull.bot
+        bull.armed := false
+        bullEnd    := true
+        bullWhy    := "invalidated"
+    else if bar_index - bull.brkBar > maxWait
+        bull.armed := false
+        bullEnd    := true
+        bullWhy    := "expired"
+    else if not na(bull.touch) and bar_index - bull.touch <= 2 and close > open and longPd <= pdLimit
+        longTrig := true
+
+if bc and bear.armed and bar_index > bear.brkBar
+    bear.rngLo := math.min(bear.rngLo, low)
+    bear.ext   := math.max(bear.ext, high)
+    float effBot = useFvgZone and bear.hasFvg ? math.min(bear.bot, bear.fvgBot) : bear.bot
+    if high >= effBot
+        bear.touch := bar_index
+    float rng = bear.rngHi - bear.rngLo
+    shortPd := rng > 0 ? (bear.rngHi - close) / rng * 100.0 : 100.0
+    if close > bear.top
+        bear.armed := false
+        bearEnd    := true
+        bearWhy    := "invalidated"
+    else if bar_index - bear.brkBar > maxWait
+        bear.armed := false
+        bearEnd    := true
+        bearWhy    := "expired"
+    else if not na(bear.touch) and bar_index - bear.touch <= 2 and close < open and shortPd <= pdLimit
+        shortTrig := true
+
+// Stop, grade and the final gate. A trigger that fails a gate keeps the setup
+// armed — a deeper retest can still qualify later.
+float longStop   = na
+float shortStop  = na
+int   longGrade  = 0
+int   shortGrade = 0
+if longTrig
+    longStop  := math.min(bull.ext - stopBuf * atr, close - minRisk * atr)
+    longGrade := (bull.sweep ? 1 : 0) + (bull.hasFvg ? 1 : 0) + (longPd <= oteLvl ? 1 : 0)
+if shortTrig
+    shortStop  := math.max(bear.ext + stopBuf * atr, close + minRisk * atr)
+    shortGrade := (bear.sweep ? 1 : 0) + (bear.hasFvg ? 1 : 0) + (shortPd <= oteLvl ? 1 : 0)
+
+bool buySig  = longTrig  and longGrade  >= gradeMin and (not htfOn or htfDir ==  1) and close - longStop  <= maxRisk * atr and cur.dir != 1
+bool sellSig = shortTrig and shortGrade >= gradeMin and (not htfOn or htfDir == -1) and shortStop - close <= maxRisk * atr and cur.dir != -1
+
+if buySig
+    bull.armed := false
+    bullEnd    := true
+    bullWhy    := "fired"
+if sellSig
+    bear.armed := false
+    bearEnd    := true
+    bearWhy    := "fired"
+
+// -----------------------------------------------------------------------------
+// 7 · MARKET STRUCTURE — BOS / CHoCH, and capture of new setups
+//     A break is a CLOSE beyond the last confirmed swing. On every break the
+//     breaking leg is measured: its origin (the extreme since the broken
+//     swing), the order-block candle at that origin, whether a displacement
+//     candle or a fair value gap drove it, and whether the origin swept
+//     liquidity.
+// -----------------------------------------------------------------------------
+var float shLvl  = na
+var int   shBar  = na
+var bool  shOpen = false
+var float slLvl  = na
+var int   slBar  = na
+var bool  slOpen = false
+var int   trend  = 0
+
+if bc and not na(ph)
+    shLvl  := ph
+    shBar  := bar_index - swingLen
+    shOpen := true
+if bc and not na(pl)
+    slLvl  := pl
+    slBar  := bar_index - swingLen
+    slOpen := true
+
+bool rawUp = bc and shOpen and close > shLvl
+bool rawDn = bc and slOpen and close < slLvl
+// An outside bar can break both sides at once — resolve by where it closed.
+bool bullBreak = rawUp and (not rawDn or close >= open)
+bool bearBreak = rawDn and (not rawUp or close < open)
+bool bullChoch = bullBreak and trend < 0
+bool bearChoch = bearBreak and trend > 0
+float brkLvl   = bullBreak ? shLvl : bearBreak ? slLvl : na
+int   brkFrom  = bullBreak ? shBar : bearBreak ? slBar : na
+
+if bullBreak
+    int kS = math.min(bar_index - shBar, MAX_SCAN)
+    // origin of the breaking leg = lowest low since the broken swing high
+    int   kO    = 0
+    float legLo = low
+    for i = 1 to kS
+        if low[i] < legLo
+            legLo := low[i]
+            kO    := i
+    // order block = last down-close candle at, or just before, that origin
+    int kOB  = kO
+    int kMax = math.min(kO + OB_SEARCH, bar_index)
+    for i = kO to kMax
+        if close[i] < open[i]
+            kOB := i
+            break
+    // displacement and the first fair value gap of the leg (origin -> break)
+    float legHi = high
+    bool  disp  = false
+    int   kF    = -1
+    for i = 0 to kO
+        legHi := math.max(legHi, high[i])
+        if close[i] - open[i] >= dispMult * atr[i]
+            disp := true
+        if i + 2 <= kO and low[i] > high[i + 2] and close[i + 1] > high[i + 2] and low[i] - high[i + 2] >= fvgMin * atr[i]
+            kF := i
+    bool typeOk = breakUse == "CHoCH + BOS" or (breakUse == "CHoCH only (reversals)" ? bullChoch : not bullChoch)
+    if (disp or kF >= 0) and typeOk
+        if bull.armed
+            bullEnd := true
+            bullWhy := "replaced"
+        bull.armed  := true
+        bull.brkBar := bar_index
+        bull.obBar  := bar_index - kOB
+        bull.bot    := legLo
+        bull.top    := math.max(math.min(high[kOB], legLo + obMaxH * atr), legLo + syminfo.mintick)
+        bull.hasFvg := kF >= 0
+        bull.fvgTop := na
+        bull.fvgBot := na
+        bull.fvgBar := na
+        if kF >= 0
+            bull.fvgTop := low[kF]
+            bull.fvgBot := high[kF + 2]
+            bull.fvgBar := bar_index - kF - 2
+        bull.sweep  := not na(lastSslSweep) and lastSslSweep >= bar_index - kO - OB_SEARCH
+        bull.choch  := bullChoch
+        bull.rngLo  := legLo
+        bull.rngHi  := legHi
+        bull.ext    := legLo
+        bull.touch  := na
+        bullNew     := true
+    shOpen := false
+    trend  := 1
+
+if bearBreak
+    int kS = math.min(bar_index - slBar, MAX_SCAN)
+    // origin of the breaking leg = highest high since the broken swing low
+    int   kO    = 0
+    float legHi = high
+    for i = 1 to kS
+        if high[i] > legHi
+            legHi := high[i]
+            kO    := i
+    // order block = last up-close candle at, or just before, that origin
+    int kOB  = kO
+    int kMax = math.min(kO + OB_SEARCH, bar_index)
+    for i = kO to kMax
+        if close[i] > open[i]
+            kOB := i
+            break
+    // displacement and the first fair value gap of the leg (origin -> break)
+    float legLo = low
+    bool  disp  = false
+    int   kF    = -1
+    for i = 0 to kO
+        legLo := math.min(legLo, low[i])
+        if open[i] - close[i] >= dispMult * atr[i]
+            disp := true
+        if i + 2 <= kO and high[i] < low[i + 2] and close[i + 1] < low[i + 2] and low[i + 2] - high[i] >= fvgMin * atr[i]
+            kF := i
+    bool typeOk = breakUse == "CHoCH + BOS" or (breakUse == "CHoCH only (reversals)" ? bearChoch : not bearChoch)
+    if (disp or kF >= 0) and typeOk
+        if bear.armed
+            bearEnd := true
+            bearWhy := "replaced"
+        bear.armed  := true
+        bear.brkBar := bar_index
+        bear.obBar  := bar_index - kOB
+        bear.top    := legHi
+        bear.bot    := math.min(math.max(low[kOB], legHi - obMaxH * atr), legHi - syminfo.mintick)
+        bear.hasFvg := kF >= 0
+        bear.fvgTop := na
+        bear.fvgBot := na
+        bear.fvgBar := na
+        if kF >= 0
+            bear.fvgTop := low[kF + 2]
+            bear.fvgBot := high[kF]
+            bear.fvgBar := bar_index - kF - 2
+        bear.sweep  := not na(lastBslSweep) and lastBslSweep >= bar_index - kO - OB_SEARCH
+        bear.choch  := bearChoch
+        bear.rngLo  := legLo
+        bear.rngHi  := legHi
+        bear.ext    := legHi
+        bear.touch  := na
+        bearNew     := true
+    slOpen := false
+    trend  := -1
+
+// Open the new call. An opposite call still open is closed at this close.
+int sigGrade = buySig ? longGrade : sellSig ? shortGrade : 0
+if buySig or sellSig
+    if cur.dir != 0
+        book.record(cur.hits, cur.dir * (close - cur.entry) / cur.risk)
+        evText := "reversed by an opposite call"
+    cur.dir   := buySig ? 1 : -1
+    cur.entry := close
+    cur.stop  := buySig ? longStop : shortStop
+    cur.risk  := math.abs(close - cur.stop)
+    cur.t1    := close + cur.dir * rr1 * cur.risk
+    cur.t2    := close + cur.dir * rr2 * cur.risk
+    cur.t3    := close + cur.dir * rr3 * cur.risk
+    cur.hits  := 0
+    cur.bar   := bar_index
+    cur.grade := f_grade(sigGrade)
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  END OF ENGINE
+// ═════════════════════════════════════════════════════════════════════════════
+
+// -----------------------------------------------------------------------------
+// 8 · VISUALS
+// -----------------------------------------------------------------------------
+// BUY / SELL labels — plotshape rather than label.new so that calls never get
+// garbage-collected on long histories. One shape per grade keeps the text fixed.
+plotshape(showSig and buySig and sigGrade == 3, "BUY A+", shape.labelup, location.belowbar, color = cBull, text = "BUY\nA+", textcolor = color.white, size = size.small)
+plotshape(showSig and buySig and sigGrade == 2, "BUY A",  shape.labelup, location.belowbar, color = cBull, text = "BUY\nA",  textcolor = color.white, size = size.small)
+plotshape(showSig and buySig and sigGrade == 1, "BUY B",  shape.labelup, location.belowbar, color = color.new(cBull, 25), text = "BUY\nB", textcolor = color.white, size = size.small)
+plotshape(showSig and buySig and sigGrade == 0, "BUY C",  shape.labelup, location.belowbar, color = color.new(cBull, 45), text = "BUY", textcolor = color.white, size = size.small)
+plotshape(showSig and sellSig and sigGrade == 3, "SELL A+", shape.labeldown, location.abovebar, color = cBear, text = "SELL\nA+", textcolor = color.white, size = size.small)
+plotshape(showSig and sellSig and sigGrade == 2, "SELL A",  shape.labeldown, location.abovebar, color = cBear, text = "SELL\nA",  textcolor = color.white, size = size.small)
+plotshape(showSig and sellSig and sigGrade == 1, "SELL B",  shape.labeldown, location.abovebar, color = color.new(cBear, 25), text = "SELL\nB", textcolor = color.white, size = size.small)
+plotshape(showSig and sellSig and sigGrade == 0, "SELL C",  shape.labeldown, location.abovebar, color = color.new(cBear, 45), text = "SELL", textcolor = color.white, size = size.small)
+
+// Levels of the open call, drawn from the bar after the call to the bar it ends.
+bool lvlOn = showLevels and wasOpen
+plot(lvlOn ? pEntry : na, "Call entry", color = color.new(cNeut, 20), style = plot.style_linebr)
+plot(lvlOn ? pStop  : na, "Call stop",  color = cBear, style = plot.style_linebr, linewidth = 2)
+plot(lvlOn ? pT1    : na, "TP1", color = color.new(cBull, 0),  style = plot.style_linebr)
+plot(lvlOn ? pT2    : na, "TP2", color = color.new(cBull, 30), style = plot.style_linebr)
+plot(lvlOn ? pT3    : na, "TP3", color = color.new(cBull, 55), style = plot.style_linebr)
+
+var array<label> lvlTags = array.new<label>()
+if barstate.islast
+    while array.size(lvlTags) > 0
+        label.delete(array.pop(lvlTags))
+    if showLevels and cur.dir != 0
+        int xr = bar_index + 3
+        array.push(lvlTags, label.new(xr, cur.entry, "Entry " + str.tostring(cur.entry, format.mintick), style = label.style_label_left, color = color.new(cNeut, 20), textcolor = color.white, size = size.small))
+        array.push(lvlTags, label.new(xr, cur.stop, (cur.stop == cur.entry ? "Stop (BE) " : "Stop ") + str.tostring(cur.stop, format.mintick), style = label.style_label_left, color = color.new(cBear, 10), textcolor = color.white, size = size.small))
+        array.push(lvlTags, label.new(xr, cur.t1, "TP1 " + str.tostring(cur.t1, format.mintick) + (cur.hits >= 1 ? " ✓" : ""), style = label.style_label_left, color = color.new(cBull, 10), textcolor = color.white, size = size.small))
+        array.push(lvlTags, label.new(xr, cur.t2, "TP2 " + str.tostring(cur.t2, format.mintick) + (cur.hits >= 2 ? " ✓" : ""), style = label.style_label_left, color = color.new(cBull, 30), textcolor = color.white, size = size.small))
+        array.push(lvlTags, label.new(xr, cur.t3, "TP3 " + str.tostring(cur.t3, format.mintick), style = label.style_label_left, color = color.new(cBull, 50), textcolor = color.white, size = size.small))
+
+// Structure breaks
+if showStruct and (bullBreak or bearBreak)
+    color sc = bullBreak ? cBull : cBear
+    bool  ch = bullBreak ? bullChoch : bearChoch
+    line.new(brkFrom, brkLvl, bar_index, brkLvl, color = color.new(sc, 30), style = ch ? line.style_solid : line.style_dashed, width = 1)
+    label.new(math.round((brkFrom + bar_index) / 2.0), brkLvl, ch ? "CHoCH" : "BOS", style = bullBreak ? label.style_label_down : label.style_label_up, color = color.new(sc, 100), textcolor = sc, size = size.tiny)
+
+plotshape(showLiq and sslSweptNow, "Sell-side sweep", shape.xcross, location.belowbar, color = cBull, size = size.tiny)
+plotshape(showLiq and bslSweptNow, "Buy-side sweep",  shape.xcross, location.abovebar, color = cBear, size = size.tiny)
+
+// Armed zones: extend while armed, freeze when the setup fires / fails / expires.
+if showZones
+    if bullEnd
+        color fc = bullWhy == "fired" ? color.new(cBull, 75) : color.new(cNeut, 88)
+        if not na(bull.zBox)
+            box.set_right(bull.zBox, bar_index)
+            box.set_bgcolor(bull.zBox, fc)
+            box.set_border_color(bull.zBox, color.new(fc, 60))
+        if not na(bull.fBox)
+            box.set_right(bull.fBox, bar_index)
+            box.set_bgcolor(bull.fBox, color.new(fc, 94))
+        if not na(bull.eqLn)
+            line.delete(bull.eqLn)
+        bull.zBox := na
+        bull.fBox := na
+        bull.eqLn := na
+    if bearEnd
+        color fc = bearWhy == "fired" ? color.new(cBear, 75) : color.new(cNeut, 88)
+        if not na(bear.zBox)
+            box.set_right(bear.zBox, bar_index)
+            box.set_bgcolor(bear.zBox, fc)
+            box.set_border_color(bear.zBox, color.new(fc, 60))
+        if not na(bear.fBox)
+            box.set_right(bear.fBox, bar_index)
+            box.set_bgcolor(bear.fBox, color.new(fc, 94))
+        if not na(bear.eqLn)
+            line.delete(bear.eqLn)
+        bear.zBox := na
+        bear.fBox := na
+        bear.eqLn := na
+    if bullNew
+        bull.zBox := box.new(bull.obBar, bull.top, bar_index, bull.bot, border_color = color.new(cBull, 50), bgcolor = color.new(cBull, 80), text = (bull.choch ? "CHoCH" : "BOS") + " · OB", text_size = size.tiny, text_color = cBull, text_halign = text.align_right, text_valign = text.align_bottom)
+        if bull.hasFvg
+            bull.fBox := box.new(bull.fvgBar, bull.fvgTop, bar_index, bull.fvgBot, border_color = color.new(cBull, 85), bgcolor = color.new(cBull, 90), text = "FVG", text_size = size.tiny, text_color = color.new(cBull, 30), text_halign = text.align_right)
+        bull.eqLn := line.new(bull.brkBar, bull.rngLo, bar_index, bull.rngLo, color = color.new(cNeut, 30), style = line.style_dotted)
+    if bearNew
+        bear.zBox := box.new(bear.obBar, bear.top, bar_index, bear.bot, border_color = color.new(cBear, 50), bgcolor = color.new(cBear, 80), text = (bear.choch ? "CHoCH" : "BOS") + " · OB", text_size = size.tiny, text_color = cBear, text_halign = text.align_right, text_valign = text.align_top)
+        if bear.hasFvg
+            bear.fBox := box.new(bear.fvgBar, bear.fvgTop, bar_index, bear.fvgBot, border_color = color.new(cBear, 85), bgcolor = color.new(cBear, 90), text = "FVG", text_size = size.tiny, text_color = color.new(cBear, 30), text_halign = text.align_right)
+        bear.eqLn := line.new(bear.brkBar, bear.rngHi, bar_index, bear.rngHi, color = color.new(cNeut, 30), style = line.style_dotted)
+    // keep armed zones and their entry-limit line (the discount / premium edge) live
+    if bull.armed and not na(bull.zBox)
+        float lim = bull.rngLo + (bull.rngHi - bull.rngLo) * pdLimit / 100.0
+        box.set_right(bull.zBox, bar_index)
+        if not na(bull.fBox)
+            box.set_right(bull.fBox, bar_index)
+        line.set_xy2(bull.eqLn, bar_index, lim)
+        line.set_y1(bull.eqLn, lim)
+    if bear.armed and not na(bear.zBox)
+        float lim = bear.rngHi - (bear.rngHi - bear.rngLo) * pdLimit / 100.0
+        box.set_right(bear.zBox, bar_index)
+        if not na(bear.fBox)
+            box.set_right(bear.fBox, bar_index)
+        line.set_xy2(bear.eqLn, bar_index, lim)
+        line.set_y1(bear.eqLn, lim)
+
+barcolor(colorBars ? (trend > 0 ? cBull : trend < 0 ? cBear : cNeut) : na, title = "Structure colour")
+
+// Data Window — inspect any historical bar
+plot(trend,    "Structure trend (+1 / −1)", display = display.data_window)
+plot(htfDir,   "HTF bias (+1 / −1)", display = display.data_window)
+plot(buySig or sellSig ? sigGrade : na, "Call grade (0–3)", display = display.data_window)
+plot(longPd,   "Long: position in range %", display = display.data_window)
+plot(shortPd,  "Short: position in range %", display = display.data_window)
+plot(atr,      "ATR", display = display.data_window)
+
+// -----------------------------------------------------------------------------
+// 9 · PANEL
+// -----------------------------------------------------------------------------
+tablePos = tblPos == "Top left" ? position.top_left :
+     tblPos == "Bottom right"   ? position.bottom_right :
+     tblPos == "Bottom left"    ? position.bottom_left :
+     tblPos == "Middle right"   ? position.middle_right : position.top_right
+
+color cPanel = darkUI ? color.new(#131722, 12) : color.new(#ffffff, 8)
+color cHdr   = darkUI ? color.new(#2a2e39, 8)  : color.new(#e0e3eb, 8)
+color cTxt   = darkUI ? #d1d4dc : #131722
+color cDim   = darkUI ? #787b86 : #5d606b
+
+var table dash = table.new(tablePos, 2, 13, border_width = 1, frame_width = 1, frame_color = cHdr)
+
+f_row(t, r, k, v, col, bg) =>
+    table.cell(t, 0, r, k, text_color = cDim, bgcolor = bg, text_size = size.small, text_halign = text.align_left)
+    table.cell(t, 1, r, v, text_color = col,  bgcolor = bg, text_size = size.small, text_halign = text.align_right)
+
+f_dirTxt(d) => d > 0 ? "▲ bullish" : d < 0 ? "▼ bearish" : "—"
+
+if showPanel and barstate.islast
+    string armTxt = bull.armed and bear.armed ? "buy & sell zones" :
+         bull.armed ? "buy zone · " + str.tostring(bar_index - bull.brkBar) + " bars" :
+         bear.armed ? "sell zone · " + str.tostring(bar_index - bear.brkBar) + " bars" : "none — waiting for a break"
+    string callTxt = cur.dir > 0 ? "BUY " + cur.grade : cur.dir < 0 ? "SELL " + cur.grade : "flat"
+    if cur.dir != 0
+        callTxt += " · " + str.tostring(bar_index - cur.bar) + " bars"
+    else if not na(cur.bar)
+        callTxt += " · last call " + str.tostring(bar_index - cur.bar) + " bars ago"
+    string tpTxt = cur.dir == 0 ? "—" :
+         str.tostring(cur.t1, format.mintick) + (cur.hits >= 1 ? " ✓" : "") + " / " +
+         str.tostring(cur.t2, format.mintick) + (cur.hits >= 2 ? " ✓" : "") + " / " +
+         str.tostring(cur.t3, format.mintick)
+    float pf = book.lost > 0 ? book.won / book.lost : na
+    string hitTxt = book.calls == 0 ? "—" :
+         str.tostring(100.0 * book.t1 / book.calls, "#") + "% / " +
+         str.tostring(100.0 * book.t2 / book.calls, "#") + "% / " +
+         str.tostring(100.0 * book.t3 / book.calls, "#") + "%"
+    string netTxt = book.calls == 0 ? "—" :
+         (book.net >= 0 ? "+" : "") + str.tostring(book.net, "#.#") + "R · PF " + (na(pf) ? "∞" : str.tostring(pf, "#.##"))
+
+    f_row(dash, 0,  "SMC SIGNALS", syminfo.ticker + " · " + timeframe.period, cTxt, cHdr)
+    f_row(dash, 1,  "Structure", f_dirTxt(trend), trend > 0 ? cBull : trend < 0 ? cBear : cDim, cPanel)
+    f_row(dash, 2,  "HTF bias · " + (htfOn ? htfRes : "off"), htfOn ? f_dirTxt(htfDir) : "off", htfDir > 0 ? cBull : htfDir < 0 ? cBear : cDim, cPanel)
+    f_row(dash, 3,  "Armed setup", armTxt, bull.armed and not bear.armed ? cBull : bear.armed and not bull.armed ? cBear : cDim, cPanel)
+    f_row(dash, 4,  "OPEN CALL", "", cTxt, cHdr)
+    f_row(dash, 5,  "Call", callTxt, cur.dir > 0 ? cBull : cur.dir < 0 ? cBear : cDim, cPanel)
+    f_row(dash, 6,  "Entry", cur.dir == 0 ? "—" : str.tostring(cur.entry, format.mintick), cTxt, cPanel)
+    f_row(dash, 7,  "Stop", cur.dir == 0 ? "—" : str.tostring(cur.stop, format.mintick) + (cur.stop == cur.entry ? "  (BE)" : ""), cBear, cPanel)
+    f_row(dash, 8,  "TP1 / TP2 / TP3", tpTxt, cBull, cPanel)
+    f_row(dash, 9,  "RESULTS ON THIS CHART", "", cTxt, cHdr)
+    f_row(dash, 10, "Closed calls", str.tostring(book.calls) + (cur.dir != 0 ? "  (+1 open)" : ""), cTxt, cPanel)
+    f_row(dash, 11, "Reached TP1 / TP2 / TP3", hitTxt, cTxt, cPanel)
+    f_row(dash, 12, "Net (⅓ at each TP) · PF", netTxt, book.net > 0 ? cBull : book.net < 0 ? cBear : cDim, cPanel)
+
+// -----------------------------------------------------------------------------
+// 10 · ALERTS
+//      "Any alert() function call" delivers the detailed messages below;
+//      the alertcondition()s are there for simple one-line alerts.
+// -----------------------------------------------------------------------------
+alertcondition(buySig,  "FSMC · BUY call",  "FSMC BUY {{ticker}} {{interval}} @ {{close}}")
+alertcondition(sellSig, "FSMC · SELL call", "FSMC SELL {{ticker}} {{interval}} @ {{close}}")
+alertcondition(buySig or sellSig, "FSMC · Any call", "FSMC call {{ticker}} {{interval}} @ {{close}}")
+alertcondition(bullChoch or bearChoch, "FSMC · Change of character", "FSMC CHoCH {{ticker}} {{interval}}")
+
+if buySig or sellSig
+    alert("FSMC " + (buySig ? "BUY " : "SELL ") + cur.grade + " " + syminfo.ticker + " " + timeframe.period +
+         " | entry " + str.tostring(cur.entry, format.mintick) +
+         " | stop " + str.tostring(cur.stop, format.mintick) +
+         " | TP1 " + str.tostring(cur.t1, format.mintick) +
+         " | TP2 " + str.tostring(cur.t2, format.mintick) +
+         " | TP3 " + str.tostring(cur.t3, format.mintick) +
+         " | risk " + str.tostring(cur.risk / atr, "#.##") + " ATR", alert.freq_once_per_bar_close)
+if evText != ""
+    alert("FSMC " + syminfo.ticker + " " + timeframe.period + " | " + evText, alert.freq_once_per_bar_close)
